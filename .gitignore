@@ -38,5 +38,7 @@ checksum*
 /root-packages/*/cache
 /x11-packages/*/cache
 
+/termux-display-client/
+
 # Temp .git directories for packages built from local sources "file://"
 /*.git

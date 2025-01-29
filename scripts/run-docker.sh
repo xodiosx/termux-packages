@@ -49,6 +49,8 @@ $SUDO docker start $CONTAINER_NAME >/dev/null 2>&1 || {
 		--detach \
 		--init \
 		--name $CONTAINER_NAME \
+		-p 8080:8080\
+		-p 8081:8081\
 		--volume $VOLUME \
 		$SEC_OPT \
 		--tty \

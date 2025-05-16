@@ -3,20 +3,25 @@ TERMUX_PKG_DESCRIPTION="Modular wayland compositor library"
 TERMUX_PKG_LICENSE="MIT"
 TERMUX_PKG_MAINTAINER="@termux"
 TERMUX_PKG_VERSION="0.18.2"
-TERMUX_PKG_SRCURL=http://172.17.0.2:8081/termux-packages/wlroots-termux.tar.gz
-TERMUX_PKG_SHA256=5ad151170d2c15311eae0bd87e0958272f2cc2b10a5a295bb7d8792f7d8a6a82
+TERMUX_PKG_SRCURL=https://gitlab.freedesktop.org/wlroots/wlroots/-/archive/${TERMUX_PKG_VERSION}/wlroots-${TERMUX_PKG_VERSION}.tar.bz2
+TERMUX_PKG_SHA256=a28061f7778f28f7be377fd4d6f0ebd58cb2a63b52460e9fde28e2ab43e80cab
 TERMUX_PKG_AUTO_UPDATE=true
-TERMUX_PKG_DEPENDS="libdrm, libglvnd, libpixman, libwayland, libxcb, libxkbcommon, xcb-util-renderutil, xcb-util-wm, termux-gui-c, termux-display-client"
+TERMUX_PKG_DEPENDS="libdrm, libglvnd, libpixman, libwayland, libxcb, libxkbcommon, xcb-util-renderutil, xcb-util-wm, termux-gui-c"
 TERMUX_PKG_BUILD_DEPENDS="libglvnd-dev, libwayland-cross-scanner, libwayland-protocols, xwayland"
 TERMUX_PKG_RECOMMENDS="xwayland"
 TERMUX_PKG_BREAKS="sway (<< 1.10 )"
 TERMUX_PKG_EXTRA_CONFIGURE_ARGS="
--Dexamples=true
+-Dexamples=false
 -Dxwayland=enabled
 -Dsession=disabled
--Dbackends=x11,termuxgui,termuxdc
+-Dbackends=x11,termuxgui
 -Drenderers=gles2,vulkan
 "
+
+termux_step_post_get_source() {
+	cp -r $TERMUX_PKG_BUILDER_DIR/src/* $TERMUX_PKG_SRCDIR/
+}
+
 termux_step_pre_configure() {
 	export PATH="$TERMUX_PREFIX/opt/libwayland/cross/bin:$PATH"
 

@@ -4,28 +4,30 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-bootstrap:
+  build-xodos-bootstrap:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout termux-packages
-      uses: actions/checkout@v4
-      with:
-        repository: xodiosx/termux-packages
-        path: termux-packages
+      - name: Checkout XoDos Termux-Packages repo
+        uses: actions/checkout@v4
 
-    - name: Override TERMUX_APP_PACKAGE
-      run: |
-        cd termux-packages
-        sed -i 's/TERMUX_APP_PACKAGE="com.termux"/TERMUX_APP_PACKAGE="com.xodos"/' scripts/properties.sh
+      - name: Install required packages
+        run: |
+          sudo apt update
+          sudo apt install -y wget tar zip build-essential
 
-    - name: Build bootstrap for aarch64 (Android 10+)
-      run: |
-        cd termux-packages
-        ./scripts/run-docker.sh ./scripts/build-bootstraps.sh --architectures aarch64 --android10 -f
+      - name: Set XoDos package name and prefix
+        run: |
+          echo "TERMUX_APP_PACKAGE=com.xodos" >> $GITHUB_ENV
+          echo "TERMUX_PREFIX=/data/data/com.xodos/files/usr" >> $GITHUB_ENV
 
-    - name: Upload XoDos Bootstrap
-      uses: actions/upload-artifact@v4
-      with:
-        name: xodos-bootstrap-aarch64
-        path: termux-packages/output/bootstrap-aarch64.zip￼Enter
+      - name: Run generate-bootstraps.sh
+        run: |
+          chmod +x ./scripts/generate-bootstraps.sh
+          ./scripts/generate-bootstraps.sh --architectures aarch64 --android10 -f
+
+      - name: Upload bootstrap zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: xodos-bootstrap-aarch64
+          path: bootstrap-aarch64.zip

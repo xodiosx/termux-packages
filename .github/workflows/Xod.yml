@@ -26,6 +26,30 @@ jobs:
           echo "$SKIP_CHECKSUM"
           #find . -type f -name "build.sh" -exec sed -i \
           #-E '/^TERMUX_PKG_SHA256=/s|=.*|="SKIP_CHECKSUM"|' {} +
+         
+          - name: Build bootstrap packages
+            run: |
+              ./scripts/run-docker.sh ./build-package.sh libandroid-support
+              ./scripts/run-docker.sh ./build-package.sh termux-elf-cleaner
+              ./scripts/run-docker.sh ./build-package.sh termux-exec
+              ./scripts.run-docker.sh ./build-package.sh bash
+              ./scripts/run-docker.sh ./build-package.sh bzip2
+              ./scripts/run-docker.sh ./build-package.sh coreutils
+              ./scripts/run-docker.sh ./build-package.sh curl
+              ./scripts/run-docker.sh ./build-package.sh diffutils
+              ./scripts/run-docker.sh ./build-package.sh findutils
+              ./scripts/run-docker.sh ./build-package.sh gawk
+              ./scripts/run-docker.sh ./build-package.sh grep
+              ./scripts/run-docker.sh ./build-package.sh gzip
+              ./scripts/run-docker.sh ./build-package.sh less
+              ./scripts/run-docker.sh ./build-package.sh nano
+              ./scripts/run-docker.sh ./build-package.sh ncurses
+              ./scripts/run-docker.sh ./build-package.sh procps
+              ./scripts/run-docker.sh ./build-package.sh sed
+              ./scripts/run-docker.sh ./build-package.sh tar
+              ./scripts/run-docker.sh ./build-package.sh unzip
+              ./scripts/run-docker.sh ./build-package.sh util-linux
+              ./scripts/run-docker.sh ./build-package.sh xz-utils
        
       - name: Run build-bootstraps.sh inside Docker
         run: |

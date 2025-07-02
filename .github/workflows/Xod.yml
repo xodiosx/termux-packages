@@ -21,11 +21,10 @@ jobs:
           sed -i 's|TERMUX_APP_PACKAGE=.*|TERMUX_APP_PACKAGE="com.xodos"|' ./scripts/properties.sh
           sed -i 's|TERMUX_PREFIX=.*|TERMUX_PREFIX="/data/data/com.xodos/files/usr"|' ./scripts/properties.sh
           
-      - name: Disable SHA256 checksum (force SKIP_CHECKSUM)
+      - name: Disable all SHA256 checksums safely
         run: |
           find . -type f -name "build.sh" -exec sed -i \
-            -E 's/^(TERMUX_PKG_SHA256)=.*/\1="SKIP_CHECKSUM"/' {} +
-
+          -E '/^TERMUX_PKG_SHA256=/s|=.*|="SKIP_CHECKSUM"|' {} +
        
       - name: Run build-bootstraps.sh inside Docker
         run: |

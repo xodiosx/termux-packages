@@ -11,27 +11,27 @@ jobs:
       - name: Checkout XoDos Termux-Packages repo
         uses: actions/checkout@v4
 
-      - name: Install required packages
+      - name: Ensure Docker is running
         run: |
-          sudo apt update
-          sudo apt install -y wget tar zip build-essential
+          sudo systemctl start docker
+          docker --version
 
-      - name: Set XoDos package name and prefix
+      - name: Set custom XoDos package name
         run: |
-          echo "TERMUX_APP_PACKAGE=com.xodos" >> $GITHUB_ENV
-          echo "TERMUX_PREFIX=/data/data/com.xodos/files/usr" >> $GITHUB_ENV
-
+          sed -i 's|TERMUX_APP_PACKAGE=.*|TERMUX_APP_PACKAGE="com.xodos"|' ./scripts/properties.sh
+          sed -i 's|TERMUX_PREFIX=.*|TERMUX_PREFIX="/data/data/com.xodos/files/usr"|' ./scripts/properties.sh
+          
       - name: Disable SHA256 checksum (force SKIP_CHECKSUM)
         run: |
           find . -type f -name "build.sh" -exec sed -i \
             -E 's/^(TERMUX_PKG_SHA256)=.*/\1="SKIP_CHECKSUM"/' {} +
 
-      - name: Run generate-bootstraps.sh
+       
+      - name: Run build-bootstraps.sh inside Docker
         run: |
-          chmod +x ./scripts/generate-bootstraps.sh
-          ./scripts/generate-bootstraps.sh --architectures aarch64 --android10
+          ./scripts/run-docker.sh ./scripts/build-bootstraps.sh --android10 --architectures aarch64
 
-      - name: Upload bootstrap zip
+      - name: Upload XoDos bootstrap
         uses: actions/upload-artifact@v4
         with:
           name: xodos-bootstrap-aarch64

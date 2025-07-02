@@ -16,15 +16,15 @@ jobs:
           sudo apt update
           sudo apt install -y wget tar zip build-essential
 
-      - name: Set XoDos package name and prefix
+      - name: Set TERMUX_APP_PACKAGE for XoDos
         run: |
-          echo "TERMUX_APP_PACKAGE=com.xodos" >> $GITHUB_ENV
-          echo "TERMUX_PREFIX=/data/data/com.xodos/files/usr" >> $GITHUB_ENV
+          echo 'TERMUX_APP_PACKAGE="com.xodos"' >> ./scripts/properties.sh
+          echo 'TERMUX_PREFIX="/data/data/com.xodos/files/usr"' >> ./scripts/properties.sh
 
       - name: Run generate-bootstraps.sh
         run: |
           chmod +x ./scripts/generate-bootstraps.sh
-          ./scripts/generate-bootstraps.sh --architectures aarch64 --android10 -f
+          ./scripts/generate-bootstraps.sh --architectures aarch64 --android10
 
       - name: Upload bootstrap zip
         uses: actions/upload-artifact@v4

@@ -23,8 +23,9 @@ jobs:
           
       - name: Disable all SHA256 checksums safely
         run: |
-          find . -type f -name "build.sh" -exec sed -i \
-          -E '/^TERMUX_PKG_SHA256=/s|=.*|="SKIP_CHECKSUM"|' {} +
+          echo "$SKIP_CHECKSUM"
+          #find . -type f -name "build.sh" -exec sed -i \
+          #-E '/^TERMUX_PKG_SHA256=/s|=.*|="SKIP_CHECKSUM"|' {} +
        
       - name: Run build-bootstraps.sh inside Docker
         run: |

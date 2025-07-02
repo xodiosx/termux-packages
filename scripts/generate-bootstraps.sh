@@ -251,7 +251,7 @@ add_termux_bootstrap_second_stage_files() {
 	local package_arch="$1"
 
 	echo "[*] Adding termux bootstrap second stage files..."
-
+        mkdir -p "$ROOTFS_DIR/data/data/$TERMUX_APP_PACKAGE/files/usr/etc/profile.d"
 	mkdir -p "${BOOTSTRAP_ROOTFS}/${TERMUX_BOOTSTRAP_CONFIG_DIR_PATH}"
 	sed -e "s|@TERMUX_PREFIX@|${TERMUX_PREFIX}|g" \
 		-e "s|@TERMUX_BOOTSTRAP_CONFIG_DIR_PATH@|${TERMUX_BOOTSTRAP_CONFIG_DIR_PATH}|g" \

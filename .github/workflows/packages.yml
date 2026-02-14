@@ -42,7 +42,9 @@ jobs:
     - name: Clone repository
       uses: actions/checkout@v6
       with:
-        fetch-depth: 1000
+        fetch-depth: 0
+    - name: Fetch all branches
+      run: git fetch --all --prune
     - name: Set process id limit for 32-bit builds depending on aosp-libs
       run: echo 65535 | sudo tee /proc/sys/kernel/pid_max
 

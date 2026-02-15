@@ -31,7 +31,7 @@ termux_step_pre_configure() {
 	export CFLAGS="${CFLAGS/-Oz/-O2} -flto  -U__ANDROID__"
 	export CXXFLAGS="${CXXFLAGS} -U__ANDROID__"
 }
-}
+
 
 termux_step_post_make_install() {
 	rm -fr "${TERMUX_PREFIX}/lib/gl4es/libGL.so"

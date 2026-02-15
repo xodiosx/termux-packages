@@ -3,11 +3,11 @@ TERMUX_PKG_DESCRIPTION="OpenGL driver for GLES devices"
 TERMUX_PKG_LICENSE="MIT"
 TERMUX_PKG_MAINTAINER="@termux"
 
-_COMMIT=661bb5607116e6a48a7cb004ad7cb414a138f710
+_COMMIT=ad8e385628481cd180dcc8bd67b154952d9ac3cd
 _COMMIT_DATE=20260215
-_COMMIT_TIME=080631
+_COMMIT_TIME=083421
 
-TERMUX_PKG_VERSION="1.1.6.20260215.080631g661bb560"
+TERMUX_PKG_VERSION="1.1.6.20260215.083421gad8e3856"
 
 TERMUX_PKG_SRCURL=git+https://github.com/tokokudo/gl4es
 TERMUX_PKG_GIT_BRANCH=master
@@ -28,8 +28,6 @@ termux_step_post_get_source() {
 }
 
 termux_step_pre_configure() {
-	# benchmark result as follows:
-	# -O2 -flto > -O3 -flto > -O2 > -Os > -Os -flto > -O3 > -Oz > -Oz -flto
 	export CFLAGS="${CFLAGS/-Oz/-O2} -flto"
 }
 

@@ -211,6 +211,9 @@ jobs:
           fi
         fi
 
+    - name: Fetch origin/master for lint version check
+      run: git fetch origin master:refs/remotes/origin/master --depth=1000
+    
     - name: Lint packages
       run: |
         declare -a package_recipes=()

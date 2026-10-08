@@ -73,15 +73,33 @@ jobs:
       uses: actions/checkout@v6
       with: { fetch-depth: 1000 }
 
+    # =====================================================================
+    # Patch properties.sh ONLY when the fork's app name differs from the
+    # stock "com.termux". If it's still "com.termux", leave everything
+    # alone — the workflow will build against the standard Termux prefix
+    # and just install the external .debs (whose paths must then also be
+    # com.termux for them to work).
+    # =====================================================================
     - name: Patch properties.sh
       run: |
         set -euo pipefail
         PROPS="scripts/properties.sh"
         [ -f "$PROPS" ] || { echo "::error::$PROPS not found"; exit 1; }
-        APP_PKG=$(grep -E '^TERMUX_APP__PACKAGE_NAME=' "$PROPS" | head -1 | cut -d'"' -f2)
+
+        APP_PKG=$(grep -E '^TERMUX_APP__PACKAGE_NAME=' "$PROPS" | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/')
         [ -n "$APP_PKG" ] || { echo "::error::No TERMUX_APP__PACKAGE_NAME"; exit 1; }
-        DATA_DIR="/data/data/${APP_PKG}"; ROOTFS="${DATA_DIR}/files"; PREFIX="${ROOTFS}/usr"
         echo ">>> Detected APP_PKG=$APP_PKG"
+
+        if [ "$APP_PKG" = "com.termux" ]; then
+          echo ">>> Fork is unmodified (com.termux) — skipping properties.sh patch."
+          echo ">>> NOTE: installed .debs must also use com.termux paths to work here."
+          exit 0
+        fi
+
+        DATA_DIR="/data/data/${APP_PKG}"
+        ROOTFS="${DATA_DIR}/files"
+        PREFIX="${ROOTFS}/usr"
+
         sed -i \
           -e "s|^TERMUX_REPO_APP__PACKAGE_NAME=.*|TERMUX_REPO_APP__PACKAGE_NAME=\"${APP_PKG}\"|" \
           -e "s|^TERMUX_REPO_APP__DATA_DIR=.*|TERMUX_REPO_APP__DATA_DIR=\"${DATA_DIR}\"|" \
@@ -93,7 +111,12 @@ jobs:
           -e "s|^CGCT_DEFAULT_PREFIX=.*|CGCT_DEFAULT_PREFIX=\"${PREFIX}/glibc\"|" \
           -e "s|^CGCT_DIR=.*|CGCT_DIR=\"${DATA_DIR}/cgct\"|" \
           "$PROPS"
-        sed -i -E "s|/data/data/com\.termux([^./]|/data/data/${APP_PKG}\1|g" "$PROPS"
+
+        # Replace any residual plain /data/data/com.termux paths, but only
+        # where followed by a non-dot, non-slash character (so subapp paths
+        # like com.termux.api are preserved).
+        sed -i -E "s|/data/data/com\.termux([^./])|/data/data/${APP_PKG}\1|g" "$PROPS" || true
+
         echo ">>> After:"
         grep -nE '^TERMUX_REPO_APP__|^TERMUX_REPO__|^CGCT_|/data/data/com\.termux' "$PROPS" || true
 
@@ -292,8 +315,6 @@ jobs:
 
     # =====================================================================
     # Downloads .deb deps from an EXTERNAL repo (not the current one).
-    # Source is set by the `deps-repo` input, default "xodiosx/Termux-pkg-x".
-    # Any fork or copy of this workflow will still pull from that repo.
     # =====================================================================
     - name: Download pre-built dependencies
       if: ${{ steps.build-info.outputs.skip-building != 'true' }}
@@ -305,14 +326,10 @@ jobs:
         mkdir -p debs-deps
         echo ">>> Source repo for dependencies: ${DEPS_REPO}"
 
-        # gh's default API host is github.com; passing --repo with an
-        # explicit owner/name is enough. If DEPS_REPO is on an Enterprise
-        # host, set GH_HOST env accordingly.
         mapfile -t TAGS < <(
           gh api "repos/${DEPS_REPO}/releases?per_page=100" \
             --jq '.[] | select(.tag_name != "packages") | .tag_name' | tac
         )
-
         [ "${#TAGS[@]}" -eq 0 ] && { echo "::warning::No releases found in ${DEPS_REPO}"; exit 0; }
         echo ">>> ${#TAGS[@]} release(s) — oldest first:"
         printf '    %s\n' "${TAGS[@]}"
@@ -346,6 +363,17 @@ jobs:
         set -e
 
         PREFIX=/data/data/app.xodos2/files/usr
+        # If the fork is stock com.termux, override PREFIX accordingly.
+        PROPS="/home/builder/termux-packages/scripts/properties.sh"
+        if [ -f "$PROPS" ]; then
+          DETECTED=$(grep -E '^TERMUX_APP__PACKAGE_NAME=' "$PROPS" | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/')
+          case "$DETECTED" in
+            ""|com.termux) PREFIX=/data/data/com.termux/files/usr ;;
+            *) PREFIX="/data/data/${DETECTED}/files/usr" ;;
+          esac
+        fi
+        echo ">>> Using PREFIX=$PREFIX"
+
         BUILD_ROOT=/home/builder/termux-packages
         cd "$BUILD_ROOT"
         mkdir -p "$PREFIX/var/lib/dpkg/info"
@@ -380,10 +408,6 @@ jobs:
           fi
         done
         echo "    prefilled ${prefilled} .list file(s)"
-
-        echo ""
-        echo ">>> properties.sh sanity (inside container):"
-        grep -nE '^TERMUX_REPO_APP__PACKAGE_NAME=|^TERMUX_APP__PACKAGE_NAME=|^CGCT_' "$BUILD_ROOT/scripts/properties.sh" || true
 
         echo ""
         echo ">>> Building: __PKGS_PLACEHOLDER__"

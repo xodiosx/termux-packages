@@ -74,51 +74,23 @@ jobs:
       with: { fetch-depth: 1000 }
 
     # =====================================================================
-    # Patch properties.sh ONLY when the fork's app name differs from the
-    # stock "com.termux". If it's still "com.termux", leave everything
-    # alone — the workflow will build against the standard Termux prefix
-    # and just install the external .debs (whose paths must then also be
-    # com.termux for them to work).
+    # Patch ONLY the app package name in properties.sh.
+    # No other variables are touched — no TERMUX_REPO_*, no /data/data
+    # rewrites. Just TERMUX_APP__PACKAGE_NAME -> app.xodos2.
     # =====================================================================
-    - name: Patch properties.sh
+    - name: Patch properties.sh (package name only)
       run: |
         set -euo pipefail
         PROPS="scripts/properties.sh"
         [ -f "$PROPS" ] || { echo "::error::$PROPS not found"; exit 1; }
 
-        APP_PKG=$(grep -E '^TERMUX_APP__PACKAGE_NAME=' "$PROPS" | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/')
-        [ -n "$APP_PKG" ] || { echo "::error::No TERMUX_APP__PACKAGE_NAME"; exit 1; }
-        echo ">>> Detected APP_PKG=$APP_PKG"
+        sed -i 's|^TERMUX_APP__PACKAGE_NAME=.*|TERMUX_APP__PACKAGE_NAME="app.xodos2"|' "$PROPS"
 
-        if [ "$APP_PKG" = "com.termux" ]; then
-          echo ">>> Fork is unmodified (com.termux) — skipping properties.sh patch."
-          echo ">>> NOTE: installed .debs must also use com.termux paths to work here."
-          exit 0
-        fi
-
-        DATA_DIR="/data/data/${APP_PKG}"
-        ROOTFS="${DATA_DIR}/files"
-        PREFIX="${ROOTFS}/usr"
-
-        sed -i \
-          -e "s|^TERMUX_REPO_APP__PACKAGE_NAME=.*|TERMUX_REPO_APP__PACKAGE_NAME=\"${APP_PKG}\"|" \
-          -e "s|^TERMUX_REPO_APP__DATA_DIR=.*|TERMUX_REPO_APP__DATA_DIR=\"${DATA_DIR}\"|" \
-          -e "s|^TERMUX_REPO__CORE_DIR=.*|TERMUX_REPO__CORE_DIR=\"${DATA_DIR}/termux/core\"|" \
-          -e "s|^TERMUX_REPO__APPS_DIR=.*|TERMUX_REPO__APPS_DIR=\"${DATA_DIR}/termux/app\"|" \
-          -e "s|^TERMUX_REPO__ROOTFS=.*|TERMUX_REPO__ROOTFS=\"${ROOTFS}\"|" \
-          -e "s|^TERMUX_REPO__HOME=.*|TERMUX_REPO__HOME=\"${ROOTFS}/home\"|" \
-          -e "s|^TERMUX_REPO__PREFIX=.*|TERMUX_REPO__PREFIX=\"${PREFIX}\"|" \
-          -e "s|^CGCT_DEFAULT_PREFIX=.*|CGCT_DEFAULT_PREFIX=\"${PREFIX}/glibc\"|" \
-          -e "s|^CGCT_DIR=.*|CGCT_DIR=\"${DATA_DIR}/cgct\"|" \
-          "$PROPS"
-
-        # Replace any residual plain /data/data/com.termux paths, but only
-        # where followed by a non-dot, non-slash character (so subapp paths
-        # like com.termux.api are preserved).
-        sed -i -E "s|/data/data/com\.termux([^./])|/data/data/${APP_PKG}\1|g" "$PROPS" || true
-
-        echo ">>> After:"
-        grep -nE '^TERMUX_REPO_APP__|^TERMUX_REPO__|^CGCT_|/data/data/com\.termux' "$PROPS" || true
+        echo ">>> Patched:"
+        grep -nE '^TERMUX_APP__PACKAGE_NAME=' "$PROPS" || {
+          echo "::error::TERMUX_APP__PACKAGE_NAME not found after patch"
+          exit 1
+        }
 
     - name: Patch termux_download_deb_pac.sh
       run: |
@@ -363,7 +335,6 @@ jobs:
         set -e
 
         PREFIX=/data/data/app.xodos2/files/usr
-        # If the fork is stock com.termux, override PREFIX accordingly.
         PROPS="/home/builder/termux-packages/scripts/properties.sh"
         if [ -f "$PROPS" ]; then
           DETECTED=$(grep -E '^TERMUX_APP__PACKAGE_NAME=' "$PROPS" | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/')
@@ -577,15 +548,28 @@ jobs:
       with: { fetch-depth: 1 }
     - uses: actions/download-artifact@v7
       with: { path: ./all-artifacts }
+
+    # =====================================================================
+    # FIXED: previously used `[ "$count" -eq 0 ] && exit 1` which, when
+    # count > 0, made the final command `[ ... ]` return status 1 and the
+    # whole run: block exited 1 (even though the .debs were found fine).
+    # Replaced with an explicit if-block.
+    # =====================================================================
     - name: Extract .deb files from tarballs
       run: |
         set -euo pipefail
         mkdir -p release-debs
         shopt -s nullglob
-        for archive in all-artifacts/debs-*/debs-*.tar; do tar xf "$archive" -C release-debs; done
+        for archive in all-artifacts/debs-*/debs-*.tar; do
+          echo ">>> extracting $archive"
+          tar xf "$archive" -C release-debs
+        done
         count=$(find release-debs -type f -name '*.deb' | wc -l)
         echo ">>> found ${count} .deb files"
-        [ "$count" -eq 0 ] && exit 1
+        if [ "$count" -eq 0 ]; then
+          echo "::error::No .deb files found in artifacts"
+          exit 1
+        fi
 
     - name: Upload .deb files (serialized, with retries)
       run: |

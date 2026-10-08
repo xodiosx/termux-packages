@@ -1,0 +1,595 @@
+name: releas Packages
+
+on:
+  push:
+    branches: [master, dev, 'dev/**']
+    paths: ['packages/**', 'root-packages/**', 'x11-packages/**']
+  pull_request:
+    paths: ['packages/**', 'root-packages/**', 'x11-packages/**']
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "A space-separated names of packages selected for rebuilding"
+        required: true
+      deps-repo:
+        description: "Repo that hosts the pre-built dependency releases (owner/name)"
+        required: false
+        default: "xodiosx/Termux-pkg-x"
+      skip-dep-check:
+        description: "Skip dependency resolution — just build the selected package(s)."
+        type: boolean
+        default: false
+      free-space:
+        description: "Free space even if not building large package"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  prepare-release:
+    permissions:
+      contents: write
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      timestamp: ${{ steps.tag.outputs.timestamp }}
+    steps:
+    - uses: actions/checkout@v6
+      with: { fetch-depth: 1 }
+    - name: Compute release tag
+      id: tag
+      run: |
+        TAG="$(date -u +'%Y.%m.%d-%H%M%S')"
+        echo "tag=${TAG}"       >> "$GITHUB_OUTPUT"
+        echo "timestamp=${TAG}" >> "$GITHUB_OUTPUT"
+    - name: Create release
+      run: |
+        set -euo pipefail
+        TAG="${{ steps.tag.outputs.tag }}"
+        gh release create "$TAG" \
+          --title "Build $TAG" \
+          --notes "Automated package build." \
+          --target "${{ github.sha }}" \
+          || { echo "::error::Failed to create release '$TAG'"; exit 1; }
+
+  build:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target_arch: [aarch64]
+      fail-fast: false
+    steps:
+    - name: Clone repository
+      uses: actions/checkout@v6
+      with: { fetch-depth: 1000 }
+
+    - name: Patch properties.sh
+      run: |
+        set -euo pipefail
+        PROPS="scripts/properties.sh"
+        [ -f "$PROPS" ] || { echo "::error::$PROPS not found"; exit 1; }
+        APP_PKG=$(grep -E '^TERMUX_APP__PACKAGE_NAME=' "$PROPS" | head -1 | cut -d'"' -f2)
+        [ -n "$APP_PKG" ] || { echo "::error::No TERMUX_APP__PACKAGE_NAME"; exit 1; }
+        DATA_DIR="/data/data/${APP_PKG}"; ROOTFS="${DATA_DIR}/files"; PREFIX="${ROOTFS}/usr"
+        echo ">>> Detected APP_PKG=$APP_PKG"
+        sed -i \
+          -e "s|^TERMUX_REPO_APP__PACKAGE_NAME=.*|TERMUX_REPO_APP__PACKAGE_NAME=\"${APP_PKG}\"|" \
+          -e "s|^TERMUX_REPO_APP__DATA_DIR=.*|TERMUX_REPO_APP__DATA_DIR=\"${DATA_DIR}\"|" \
+          -e "s|^TERMUX_REPO__CORE_DIR=.*|TERMUX_REPO__CORE_DIR=\"${DATA_DIR}/termux/core\"|" \
+          -e "s|^TERMUX_REPO__APPS_DIR=.*|TERMUX_REPO__APPS_DIR=\"${DATA_DIR}/termux/app\"|" \
+          -e "s|^TERMUX_REPO__ROOTFS=.*|TERMUX_REPO__ROOTFS=\"${ROOTFS}\"|" \
+          -e "s|^TERMUX_REPO__HOME=.*|TERMUX_REPO__HOME=\"${ROOTFS}/home\"|" \
+          -e "s|^TERMUX_REPO__PREFIX=.*|TERMUX_REPO__PREFIX=\"${PREFIX}\"|" \
+          -e "s|^CGCT_DEFAULT_PREFIX=.*|CGCT_DEFAULT_PREFIX=\"${PREFIX}/glibc\"|" \
+          -e "s|^CGCT_DIR=.*|CGCT_DIR=\"${DATA_DIR}/cgct\"|" \
+          "$PROPS"
+        sed -i -E "s|/data/data/com\.termux([^./]|/data/data/${APP_PKG}\1|g" "$PROPS"
+        echo ">>> After:"
+        grep -nE '^TERMUX_REPO_APP__|^TERMUX_REPO__|^CGCT_|/data/data/com\.termux' "$PROPS" || true
+
+    - name: Patch termux_download_deb_pac.sh
+      run: |
+        set -euo pipefail
+        TDP="scripts/build/termux_download_deb_pac.sh"
+        [ -f "$TDP" ] || { echo "::error::$TDP not found"; exit 1; }
+        if ! grep -q 'FORCED-BY-CI-FORCE-SOURCE-BUILD' "$TDP"; then
+          sed -i '/^termux_download_deb_pac() {/a\    # FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure' "$TDP"
+          sed -i '/FORCED-BY-CI-FORCE-SOURCE-BUILD: return failure/a\    return 1' "$TDP"
+        fi
+
+    - name: Gather build summary
+      id: build-info
+      env:
+        MANUAL_INPUT_PACKAGES: ${{ github.event.inputs.packages }}
+      run: |
+        OLD_COMMIT="${{ github.event.before }}"
+        HEAD_COMMIT="${{ github.event.after }}"
+        if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+          BASE_REF="${{ github.event.pull_request.base.ref }}"
+          git fetch origin "${BASE_REF:-master}" 2>/dev/null
+          BASE_COMMIT="$(git merge-base "origin/${BASE_REF:-master}" "HEAD")"
+          if [ -z "${{ github.event.pull_request.base.sha }}" ]; then
+            if ! git log "$OLD_COMMIT" > /dev/null; then
+              if [ "$(git branch --show-current)" = "master" ]; then
+                echo "Force push detected on master branch. Unable to proceed."; exit 1
+              else
+                OLD_COMMIT=$(git fetch origin master >&2; git merge-base origin/master $HEAD_COMMIT)
+              fi
+            fi
+            CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r "${OLD_COMMIT}" "${HEAD_COMMIT}")
+          else
+            CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r "${BASE_COMMIT}" "HEAD")
+          fi
+        fi
+        mkdir -p ./artifacts ./debs
+        touch ./debs/.placeholder
+
+        if [[ "${{ github.event_name }}" == "pull_request" && -n "$(git rev-list --merges "$(git fetch origin master >&2; git merge-base origin/master $HEAD_COMMIT)..$HEAD_COMMIT")" ]]; then
+          echo "::error ::Merge commits not allowed in PRs."; exit 1
+        fi
+
+        OLD_COMMIT="$OLD_COMMIT" HEAD_COMMIT="$HEAD_COMMIT" GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}" scripts/utils/termux_reuse_pr_build_artifacts.sh "${{ github.event_name }}" "${{ matrix.target_arch }}" || true
+
+        if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+          if grep -qiP '^\s*%ci:no-build\s*$' <(git log --format="%B" -n 1 --no-merges "HEAD"); then
+            tar cf artifacts/debs-${{ matrix.target_arch }}.tar debs
+            echo "[!] %ci:no-build — exiting."; exit 0
+          fi
+          for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
+            repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
+            while read -r file; do
+              if ! [[ $file == ${repo_path}/* ]]; then continue; fi
+              if [[ $file =~ ^${repo_path}/([.a-z0-9+-]*)/([.a-z0-9+-]*).subpackage.sh$ ]]; then
+                pkg=${BASH_REMATCH[1]}; subpkg=${BASH_REMATCH[2]}
+                [ ! -f "${repo_path}/${pkg}/${subpkg}.subpackage.sh" ] && echo "$subpkg" >> ./deleted_${repo}_packages.txt
+              elif [[ $file =~ ^${repo_path}/([.a-z0-9+-]*)/.*$ ]]; then
+                pkg=${BASH_REMATCH[1]}
+                if [ -d "${repo_path}/${pkg}" ]; then
+                  echo "$pkg" >> ./built_${repo}_packages.txt
+                  for file in $(find "${repo_path}/${pkg}/" -maxdepth 1 -type f -name \*.subpackage.sh | sort); do
+                    echo "$(basename "${file%%.subpackage.sh}")" >> ./built_${repo}_subpackages.txt
+                  done
+                else
+                  echo "$pkg" >> ./deleted_${repo}_packages
+                fi
+              fi
+            done<<<${CHANGED_FILES}
+          done
+        else
+          read -a PACKAGES <<< "${MANUAL_INPUT_PACKAGES//$'\n'/ }"
+          repo_paths=$(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json)
+          declare -a resolved=()
+          declare -a missing=()
+          for pkg in "${PACKAGES[@]}"; do
+            [ -z "$pkg" ] && continue
+            found=false
+            for repo_path in $repo_paths; do
+              repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
+              if [ -d "${repo_path}/${pkg}" ]; then
+                found=true
+                echo "$pkg" >> ./built_${repo}_packages.txt
+                for subpkg in $(find "${repo_path}/${pkg}/" -maxdepth 1 -type f -name \*.subpackage.sh | sort); do
+                  echo "$(basename "${subpkg%%.subpackage.sh}")" >> ./built_${repo}_subpackages.txt
+                done
+                resolved+=("$pkg"); break
+              fi
+            done
+            [ "$found" = true ] && continue
+            for repo_path in $repo_paths; do
+              repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
+              subfile=$(find "${repo_path}" -mindepth 2 -maxdepth 2 -type f -name "${pkg}.subpackage.sh" -print -quit 2>/dev/null || true)
+              if [ -n "$subfile" ]; then
+                parent=$(basename "$(dirname "$subfile")")
+                echo ">>> '${pkg}' is a subpackage of '${parent}' — building '${parent}'"
+                found=true
+                echo "$parent" >> ./built_${repo}_packages.txt
+                for s in $(find "${repo_path}/${parent}/" -maxdepth 1 -type f -name \*.subpackage.sh | sort); do
+                  echo "$(basename "${s%%.subpackage.sh}")" >> ./built_${repo}_subpackages.txt
+                done
+                resolved+=("$pkg -> $parent"); break
+              fi
+            done
+            [ "$found" = true ] && continue
+            missing+=("$pkg")
+            echo "::warning::Package '${pkg}' not found — skipping"
+          done
+          echo ">>> resolved ${#resolved[@]}: ${resolved[*]:-<none>}"
+          [ "${#missing[@]}" -gt 0 ] && echo ">>> skipped ${#missing[@]}: ${missing[*]}"
+          [ "${#resolved[@]}" -eq 0 ] && { echo "::error::None found."; exit 1; }
+        fi
+
+        for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
+          [ -f ./built_${repo}_packages.txt ]    && { sort ./built_${repo}_packages.txt    | uniq > ./tmp && mv ./tmp ./built_${repo}_packages.txt; }
+          [ -f ./built_${repo}_subpackages.txt ] && { sort ./built_${repo}_subpackages.txt | uniq > ./tmp && mv ./tmp ./built_${repo}_subpackages.txt; }
+          [ -f ./deleted_${repo}_packages.txt ]  && { sort ./deleted_${repo}_packages.txt  | uniq > ./tmp && mv ./tmp ./deleted_${repo}_packages.txt; }
+        done
+
+        declare -a packages=()
+        for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
+          repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
+          [ -f "./built_${repo}_packages.txt" ] && packages+=($(cat "./built_${repo}_packages.txt"))
+        done
+        echo "packages: ${packages[*]}"
+
+        free_space='false'
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          free_space=${{ github.event.inputs.free-space }}
+        else
+          grep -qiP '^\s*%ci:free-disk\s*$' <(git log --format="%B" -n 1 --no-merges "HEAD") && free_space=true
+        fi
+        if [[ "${#packages[@]}" -gt 0 ]]; then
+          for pkg in "${packages[@]}"; do
+            grep -qFx "$pkg" ./scripts/big-pkgs.list && { free_space='true'; break; }
+          done
+        fi
+        echo "free-space=$free_space" >> $GITHUB_OUTPUT
+
+        needs_docker_build=false
+        if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+          grep -qP '^scripts/(Dockerfile|properties\.sh|setup-android-sdk\.sh|setup-ubuntu\.sh)$' <<< "$CHANGED_FILES" && needs_docker_build=true
+        fi
+        echo "needs-docker-build=$needs_docker_build" >> $GITHUB_OUTPUT
+
+    - name: Lint packages
+      run: |
+        declare -a package_recipes=()
+        for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
+          repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
+          [ -f "./built_${repo}_packages.txt" ] && package_recipes+=($(cat "./built_${repo}_packages.txt" | repo_path="${repo_path}" awk '{print ENVIRON["repo_path"]"/"$1"/build.sh"}'))
+        done
+        [[ "${#package_recipes[@]}" -gt 0 ]] && ./scripts/lint-packages.sh "${package_recipes[@]}"
+
+    - name: Neutralize dependency declarations if requested
+      if: ${{ github.event.inputs.skip-dep-check == 'true' }}
+      run: |
+        set -euo pipefail
+        declare -a targets=()
+        for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
+          repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
+          [ -f "./built_${repo}_packages.txt" ] && while read -r p; do targets+=("$p"); done < "./built_${repo}_packages.txt"
+        done
+        echo ">>> SKIP_DEP_CHECK=true — neutralizing TERMUX_PKG_DEPENDS for: ${targets[*]}"
+        for pkg in "${targets[@]}"; do
+          build_sh=""
+          for rp in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
+            [ -f "${rp}/${pkg}/build.sh" ] && { build_sh="${rp}/${pkg}/build.sh"; break; }
+          done
+          [ -z "$build_sh" ] && continue
+          echo ">>> patching $build_sh"
+          sed -i \
+            -e 's|^TERMUX_PKG_DEPENDS=.*|TERMUX_PKG_DEPENDS="libandroid-support"|' \
+            -e 's|^TERMUX_PKG_BUILD_DEPENDS=.*|TERMUX_PKG_BUILD_DEPENDS=""|' \
+            -e 's|^TERMUX_PKG_DEVPACKAGE_DEPENDS=.*|TERMUX_PKG_DEVPACKAGE_DEPENDS=""|' \
+            "$build_sh"
+        done
+
+    - name: Enable zram
+      if: ${{ steps.build-info.outputs.skip-building != 'true' }}
+      uses: ./.github/actions/zram
+      with:
+        algorithm: zstd
+        size: 16G
+        priority: 100
+        device_name: /dev/zram0
+
+    - name: Load Docker image
+      if: ${{ steps.build-info.outputs.free-space == 'true' && steps.build-info.outputs.skip-building != 'true' }}
+      run: ./scripts/run-docker.sh true
+
+    - name: Free additional disk space (if needed)
+      if: ${{ steps.build-info.outputs.free-space == 'true' && steps.build-info.outputs.skip-building != 'true' }}
+      run: ./scripts/free-space.sh
+
+    # =====================================================================
+    # Downloads .deb deps from an EXTERNAL repo (not the current one).
+    # Source is set by the `deps-repo` input, default "xodiosx/Termux-pkg-x".
+    # Any fork or copy of this workflow will still pull from that repo.
+    # =====================================================================
+    - name: Download pre-built dependencies
+      if: ${{ steps.build-info.outputs.skip-building != 'true' }}
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        DEPS_REPO: ${{ github.event.inputs.deps-repo || 'xodiosx/Termux-pkg-x' }}
+      run: |
+        set -euo pipefail
+        mkdir -p debs-deps
+        echo ">>> Source repo for dependencies: ${DEPS_REPO}"
+
+        # gh's default API host is github.com; passing --repo with an
+        # explicit owner/name is enough. If DEPS_REPO is on an Enterprise
+        # host, set GH_HOST env accordingly.
+        mapfile -t TAGS < <(
+          gh api "repos/${DEPS_REPO}/releases?per_page=100" \
+            --jq '.[] | select(.tag_name != "packages") | .tag_name' | tac
+        )
+
+        [ "${#TAGS[@]}" -eq 0 ] && { echo "::warning::No releases found in ${DEPS_REPO}"; exit 0; }
+        echo ">>> ${#TAGS[@]} release(s) — oldest first:"
+        printf '    %s\n' "${TAGS[@]}"
+
+        for tag in "${TAGS[@]}"; do
+          tmpdir="$(mktemp -d)"
+          if gh release download "$tag" -p "*.deb" -D "$tmpdir" --repo "${DEPS_REPO}" 2>/dev/null; then
+            shopt -s nullglob; files=("$tmpdir"/*.deb); shopt -u nullglob
+            echo ">>> $tag: ${#files[@]} .deb"
+            for f in "${files[@]}"; do mv -f "$f" debs-deps/; done
+          fi
+          rm -rf "$tmpdir"
+        done
+        echo ">>> debs-deps: $(find debs-deps -maxdepth 1 -name '*.deb' | wc -l) unique file(s)"
+
+    - name: Build packages
+      if: ${{ steps.build-info.outputs.skip-building != 'true' }}
+      run: |
+        declare -a packages=()
+        for repo_path in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
+          repo=$(jq --raw-output '.["'${repo_path}'"].name' repo.json)
+          if [ -f "./built_${repo}_packages.txt" ]; then
+            packages+=($(cat "./built_${repo}_packages.txt"))
+          fi
+        done
+        PKGS_STR="${packages[*]}"
+        echo "packages: ${PKGS_STR}"
+
+        if [[ "${#packages[@]}" -gt 0 ]]; then
+          cat > /tmp/inner-build.sh <<'INNER_EOF'
+        set -e
+
+        PREFIX=/data/data/app.xodos2/files/usr
+        BUILD_ROOT=/home/builder/termux-packages
+        cd "$BUILD_ROOT"
+        mkdir -p "$PREFIX/var/lib/dpkg/info"
+
+        DEBS_DIR=""
+        for c in "$BUILD_ROOT/debs-deps" ./debs-deps /root/termux-packages/debs-deps /tmp/debs-deps; do
+          [ -d "$c" ] && ls "$c"/*.deb >/dev/null 2>&1 && { DEBS_DIR="$c"; break; }
+        done
+        [ -z "$DEBS_DIR" ] && { echo ">>> debs-deps not found"; exit 1; }
+        echo ">>> Found debs-deps at: $DEBS_DIR"
+
+        export DPKG_ADMINDIR="$PREFIX/var/lib/dpkg"
+
+        echo ">>> Installing .debs via dpkg"
+        dpkg --instdir=/ --force-all -i "$DEBS_DIR"/*.deb \
+          || echo ">>> dpkg -i non-zero (continuing)"
+        dpkg --instdir=/ --force-all --configure -a \
+          || echo ">>> dpkg --configure -a non-zero (continuing)"
+
+        echo ""
+        echo ">>> Prefilling missing .list files"
+        prefilled=0
+        for deb in "$DEBS_DIR"/*.deb; do
+          pkg=$(dpkg-deb -f "$deb" Package)
+          if [ ! -f "$PREFIX/var/lib/dpkg/info/${pkg}.list" ]; then
+            dpkg-deb --fsys-tarfile "$deb" 2>/dev/null \
+              | tar -tf - 2>/dev/null \
+              | grep -v '/$' \
+              | sed 's|^\./|/|' \
+              > "$PREFIX/var/lib/dpkg/info/${pkg}.list"
+            prefilled=$((prefilled + 1))
+          fi
+        done
+        echo "    prefilled ${prefilled} .list file(s)"
+
+        echo ""
+        echo ">>> properties.sh sanity (inside container):"
+        grep -nE '^TERMUX_REPO_APP__PACKAGE_NAME=|^TERMUX_APP__PACKAGE_NAME=|^CGCT_' "$BUILD_ROOT/scripts/properties.sh" || true
+
+        echo ""
+        echo ">>> Building: __PKGS_PLACEHOLDER__"
+        cd "$BUILD_ROOT"
+        ./build-package.sh -C -a aarch64 __PKGS_PLACEHOLDER__
+        INNER_EOF
+
+          sed -i "s|__PKGS_PLACEHOLDER__|${PKGS_STR}|g" /tmp/inner-build.sh
+
+          echo ">>> inner-build.sh content:"
+          cat /tmp/inner-build.sh
+          echo ">>> ---"
+
+          ENCODED=$(base64 -w0 /tmp/inner-build.sh)
+          ./scripts/run-docker.sh -d bash -c "echo '${ENCODED}' | base64 -d | bash" \
+            || echo "::warning::Some packages failed to build — continuing"
+        fi
+
+    - name: Generate build artifacts
+      if: always()
+      run: |
+        test -d termux-packages/output && mv termux-packages/output/* ./output/
+        for repo in $(jq --raw-output 'del(.pkg_format) | .[].name' repo.json); do
+          test -f ./built_${repo}_packages.txt && mv ./built_${repo}_packages.txt ./debs/
+          test -f ./built_${repo}_subpackages.txt && cat ./built_${repo}_subpackages.txt >> ./debs/built_${repo}_packages.txt && rm ./built_${repo}_subpackages.txt
+          test -f ./deleted_${repo}_packages.txt && mv ./deleted_${repo}_packages.txt ./debs/
+          if [ -f "./debs/built_${repo}_packages.txt" ] && [ -d "output" ]; then
+            while read -r pkg; do
+              find output \( -name "$pkg_*.deb" -o -name "$pkg-static_*.deb" \) -type f -print0 | xargs -0r mv -t debs/
+            done < <(cat "./debs/built_${repo}_packages.txt")
+          fi
+        done
+        echo ">>> debs/ contains: $(find debs -type f -name '*.deb' | wc -l) .deb files"
+        tar cf artifacts/debs-${{ matrix.target_arch }}-${{ github.sha }}.tar debs
+
+    - name: Verify target packages were built
+      if: always() && steps.build-info.outputs.skip-building != 'true'
+      run: |
+        set -euo pipefail
+        missing=0
+        requested=""
+        for f in ./built_*_packages.txt; do
+          [ -f "$f" ] && requested+="$(cat "$f")"$'\n'
+        done
+        requested="$(echo -n "$requested" | sort -u)"
+        [ -z "$requested" ] && { echo ">>> No packages requested"; exit 0; }
+        for pkg in $requested; do
+          if ls debs/"${pkg}"_*.deb >/dev/null 2>&1; then
+            echo ">>> ${pkg}: built OK"
+          else
+            echo "::error::Package '${pkg}' was requested but no .deb was produced"
+            missing=$((missing + 1))
+          fi
+        done
+        [ "$missing" -gt 0 ] && { echo "::error::${missing} requested package(s) failed"; exit 1; }
+
+    - name: Checksums for built *.deb files
+      if: always()
+      run: find debs -type f -name "*.deb" -exec sha256sum "{}" \; | sort -k2 | tee checksum-${{ matrix.target_arch }}-${{ github.sha }}.txt
+
+    - name: Store checksums for built *.deb files
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: checksum-${{ matrix.target_arch }}-${{ github.sha }}
+        path: checksum-${{ matrix.target_arch }}-${{ github.sha }}.txt
+
+    - name: Store *.deb files
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: debs-${{ matrix.target_arch }}-${{ github.sha }}
+        path: ./artifacts
+
+    - name: AppArmor Logs
+      if: always()
+      run: sudo dmesg | grep apparmor
+
+  test-buildorder-random:
+    permissions: { contents: read }
+    runs-on: ubuntu-slim
+    steps:
+    - uses: actions/checkout@v6
+    - run: ./scripts/bin/test-buildorder-random
+    - run: ./scripts/bin/test-buildorder-random
+      env: { TERMUX_ARCH: aarch64 }
+    - run: ./scripts/bin/test-buildorder-random
+      env: { TERMUX_ARCH: arm }
+    - run: ./scripts/bin/test-buildorder-random
+      env: { TERMUX_ARCH: i686 }
+    - run: ./scripts/bin/test-buildorder-random
+      env: { TERMUX_ARCH: x86_64 }
+
+  upload-test:
+    permissions: { contents: read }
+    if: github.repository == 'termux/termux-packages' && github.ref != 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-slim
+    steps:
+    - uses: actions/checkout@v6
+    - uses: actions/download-artifact@v7
+      with: { path: ./ }
+    - name: Check packages using Packages.bz2
+      run: |
+        for archive in debs-*/debs-{aarch64,arm,i686,x86_64}-${{ github.sha }}.tar; do tar xf "$archive"; done
+        error=0
+        for repo in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
+          name=$(jq --raw-output '.["'${repo}'"].name' repo.json)
+          url=$(jq --raw-output '.["'${repo}'"].url' repo.json)
+          distribution=$(jq --raw-output '.["'${repo}'"].distribution' repo.json)
+          component=$(jq --raw-output '.["'${repo}'"].component' repo.json)
+          [ ! -f debs/built_${name}_packages.txt ] && continue
+          for arch in aarch64 arm i686 x86_64; do
+            if [ ! -f "Packages-${repo}-${arch}" ]; then
+              curl -s --user-agent 'Termux-Packages/1.0' \
+                "${url}/dists/${distribution}/${component}/binary-${arch}/Packages.bz2" \
+                -o "Packages-${repo}-${arch}.bz2"
+              7z x "Packages-${repo}-${arch}.bz2" > /dev/null
+            fi
+            result=$(find debs -maxdepth 1 -type f | cut -d"/" -f2 | xargs -P$(nproc) -i{} grep "^Filename:.*/{}$" -nH "Packages-${repo}-${arch}" || true)
+            [ -n "$result" ] && error=1
+          done
+        done
+        [ "$error" != 0 ] && exit 1
+
+  upload:
+    concurrency: ${{ github.workflow }}
+    permissions: { contents: read }
+    if: github.repository == 'termux/termux-packages' && github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-slim
+    steps:
+    - uses: actions/checkout@v6
+    - uses: actions/download-artifact@v7
+      with: { path: ./ }
+    - name: Upload to packages.termux.dev
+      env:
+        REPOSITORY_URL: https://packages.termux.dev/aptly-api
+        GITHUB_SHA: ${{ github.sha }}
+        APTLY_API_AUTH: ${{ secrets.APTLY_API_AUTH }}
+        GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      run: |
+        source scripts/aptly_api.sh
+        for archive in debs-*/debs-{aarch64,arm,i686,x86_64}-${{ github.sha }}.tar; do tar xf "$archive"; done
+        for repo in $(jq --raw-output 'del(.pkg_format) | keys | .[]' repo.json); do
+          export REPOSITORY_NAME=$(jq --raw-output '.["'$repo'"].name' repo.json)
+          export REPOSITORY_DISTRIBUTION=$(jq --raw-output '.["'$repo'"].distribution' repo.json)
+          if [ -f debs/built_${REPOSITORY_NAME}_packages.txt ]; then
+            for filename in $(cat debs/built_${REPOSITORY_NAME}_packages.txt | sed -E 's/(..*)/debs\/\1_\*.deb debs\/\1-static_\*.deb/g'); do
+              aptly_upload_file "$filename" || exit 1
+            done
+            aptly_add_to_repo || exit 1
+            aptly_delete_dir
+            aptly_publish_repo || exit 1
+          fi
+        done
+
+  release:
+    permissions: { contents: write }
+    needs: [build, prepare-release]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+    - uses: actions/checkout@v6
+      with: { fetch-depth: 1 }
+    - uses: actions/download-artifact@v7
+      with: { path: ./all-artifacts }
+    - name: Extract .deb files from tarballs
+      run: |
+        set -euo pipefail
+        mkdir -p release-debs
+        shopt -s nullglob
+        for archive in all-artifacts/debs-*/debs-*.tar; do tar xf "$archive" -C release-debs; done
+        count=$(find release-debs -type f -name '*.deb' | wc -l)
+        echo ">>> found ${count} .deb files"
+        [ "$count" -eq 0 ] && exit 1
+
+    - name: Upload .deb files (serialized, with retries)
+      run: |
+        set -euo pipefail
+        TAG="${{ needs.prepare-release.outputs.tag }}"
+        mapfile -t FILES < <(find release-debs -type f -name '*.deb' | sort)
+        total="${#FILES[@]}"
+        i=0; failed=0
+        for f in "${FILES[@]}"; do
+          i=$((i + 1))
+          printf '[%d/%d] %s ... ' "$i" "$total" "$(basename "$f")"
+          ok=0
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$TAG" "$f" --clobber 2>/tmp/gh_err.log; then ok=1; break; fi
+            if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
+              backoff=$((attempt * 15)); echo; echo "  ↳ rate limited, sleep ${backoff}s"; sleep "$backoff"
+            else
+              backoff=$((attempt * 3)); echo; echo "  ↳ retry in ${backoff}s"; cat /tmp/gh_err.log || true; sleep "$backoff"
+            fi
+          done
+          if [ "$ok" -eq 1 ]; then echo ok; else echo "FAILED: $(basename "$f")"; failed=$((failed + 1)); fi
+          sleep 1
+        done
+        [ "$failed" -gt 0 ] && { echo "::error::${failed}/${total} failed"; exit 1; }
+        echo ">>> all ${total} uploaded"
+
+    - name: Verify release assets
+      run: |
+        TAG="${{ needs.prepare-release.outputs.tag }}"
+        count=$(gh release view "$TAG" --json assets --jq '.assets | length')
+        echo ">>> release ${TAG} has ${count} assets"

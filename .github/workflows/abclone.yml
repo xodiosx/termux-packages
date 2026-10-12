@@ -1,0 +1,326 @@
+name: Build XoDos Patched Termux Debs
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_prefix:
+        description: "Release tag prefix (final tag: <prefix>-<name>-p<N>-<ts>)"
+        required: false
+        default: "xodos"
+      max_debs:
+        description: "Max debs per repo (0 = all). Use small number for a test run."
+        required: false
+        default: "0"
+      skip:
+        description: "Space-separated repo names to skip (main x11 root glibc)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-xodos-debs
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - name: main
+            url: https://packages-cf.termux.dev/apt/termux-main/pool/main/
+            release_prefix: XoDos-main
+          - name: x11
+            url: https://packages-cf.termux.dev/apt/termux-x11/pool/main/
+            release_prefix: XoDos-x11
+          - name: root
+            url: https://packages-cf.termux.dev/apt/termux-root/pool/stable/
+            release_prefix: XoDos-root
+          - name: glibc
+            url: https://packages-cf.termux.dev/apt/termux-glibc/pool/stable/
+            release_prefix: XoDos-glibc
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      SRC_URL: ${{ matrix.url }}
+      REL_PREFIX: ${{ matrix.release_prefix }}
+      REPO_NAME: ${{ matrix.name }}
+      TAG_PREFIX: ${{ inputs.tag_prefix }}
+      MAX_DEBS: ${{ inputs.max_debs }}
+      SKIP_LIST: ${{ inputs.skip }}
+
+    steps:
+      - name: Skip check
+        id: skipcheck
+        run: |
+          set -euo pipefail
+          for s in $SKIP_LIST; do
+            if [ "$s" = "$REPO_NAME" ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo ">>> Skipping $REPO_NAME (per input)"
+              exit 0
+            fi
+          done
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.skipcheck.outputs.skip == 'false'
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        if: steps.skipcheck.outputs.skip == 'false'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils xz-utils zstd dpkg-dev perl curl ca-certificates
+
+      - name: Fetch package list
+        if: steps.skipcheck.outputs.skip == 'false'
+        id: list
+        run: |
+          set -euo pipefail
+          mkdir -p work/orig work/patched work/tmp
+
+          echo ">>> Fetching listing from $SRC_URL"
+          curl -fsSL --retry 3 --retry-delay 2 "$SRC_URL" -o work/index.html \
+            || { echo "::error::Cannot fetch $SRC_URL"; exit 1; }
+
+          # Grab every *.deb href, strip ./ and leading slash, unique
+          grep -oE 'href="[^"]+\.deb"' work/index.html \
+            | sed -E 's/^href="//; s/"$//; s|^\./||; s|^/||' \
+            | sort -u > work/debs.txt || true
+
+          total=$(wc -l < work/debs.txt | tr -d ' ')
+          echo ">>> Found $total .deb entries in $REPO_NAME"
+
+          if [ "$total" -eq 0 ]; then
+            echo "::warning::Directory listing gave no .deb files. First 40 lines of index:"
+            head -40 work/index.html || true
+            echo "::error::Nothing to do for $REPO_NAME"
+            exit 1
+          fi
+
+          if [ "$MAX_DEBS" != "0" ] && [ -n "$MAX_DEBS" ]; then
+            head -n "$MAX_DEBS" work/debs.txt > work/debs-ltd.txt
+            mv work/debs-ltd.txt work/debs.txt
+            echo ">>> Limited to first $MAX_DEBS entries"
+          fi
+
+          echo "count=$(wc -l < work/debs.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+      - name: Download all debs
+        if: steps.skipcheck.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          cd work/orig
+
+          fetch_one() {
+            local fn="$1"
+            local base
+            base="$(basename "$fn")"
+            [ -s "$base" ] && return 0
+            if curl -fsSL --retry 3 --retry-delay 2 -o "$base.tmp" "${SRC_URL}${fn}"; then
+              mv "$base.tmp" "$base"
+            else
+              rm -f "$base.tmp"
+              echo "FAIL: $fn"
+            fi
+          }
+          export -f fetch_one
+          export SRC_URL
+
+          xargs -a ../debs.txt -P 8 -I{} bash -c 'fetch_one "$@"' _ {}
+
+          got=$(find . -maxdepth 1 -name '*.deb' | wc -l | tr -d ' ')
+          echo ">>> Downloaded: $got"
+          du -sh .
+
+      - name: Patch every deb (in place)
+        if: steps.skipcheck.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+
+          patch_deb() {
+            local src="$1" dst="$2"
+            local tmp
+            tmp="$(mktemp -d)"
+
+            # Raw-extract deb -> $tmp/DEBIAN + $tmp/data/data/com.termux/...
+            if ! dpkg-deb -R "$src" "$tmp" 2>/dev/null; then
+              echo "SKIP (cannot -R): $(basename "$src")"
+              rm -rf "$tmp"; return 1
+            fi
+
+            # 1) Rename the on-disk prefix tree (if present)
+            if [ -d "$tmp/data/data/com.termux" ]; then
+              mv "$tmp/data/data/com.termux" "$tmp/data/data/app.xodos2"
+            fi
+
+            # 2) Binary-safe contents patch. Same length -> offset-preserving.
+            #    Any *textual* reference to the old prefix inside file bodies
+            #    (shebangs, hardcoded paths, configs, .pc files, ELF .rodata)
+            #    gets rewritten. -0777 slurps whole file -> binary safe.
+            find "$tmp" -type f -print0 2>/dev/null \
+              | xargs -0 -r -P 4 -n 40 \
+                  perl -0777 -i -pe 's{/data/data/com\.termux}{/data/data/app.xodos2}g' \
+              2>/dev/null || true
+
+            # 3) Also patch bare 'com.termux' refs inside maintainer scripts
+            #    (postinst / prerm / postrm / preinst).  Same length so safe.
+            if [ -d "$tmp/DEBIAN" ]; then
+              find "$tmp/DEBIAN" -type f -print0 2>/dev/null \
+                | xargs -0 -r -P 4 -n 40 \
+                    perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' \
+                2>/dev/null || true
+            fi
+
+            # 4) Repack (root:root owner without needing root)
+            if ! dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then
+              echo "SKIP (cannot -b): $(basename "$src")"
+              rm -rf "$tmp"; return 1
+            fi
+            rm -rf "$tmp"
+            return 0
+          }
+          export -f patch_deb
+
+          cd work
+          mkdir -p patched
+
+          count=0; ok=0
+          shopt -s nullglob
+          for f in orig/*.deb; do
+            base="$(basename "$f")"
+            count=$((count + 1))
+            if patch_deb "$f" "patched/$base"; then
+              ok=$((ok + 1))
+            fi
+            if [ $((count % 200)) -eq 0 ]; then
+              echo ">>> Processed $count, ok=$ok"
+            fi
+          done
+
+          echo ">>> DONE: processed=$count patched_ok=$ok"
+          ls -1 patched | head -5
+          du -sh patched
+
+      - name: Split into chunks of <= 1000
+        if: steps.skipcheck.outputs.skip == 'false'
+        id: chunks
+        run: |
+          set -euo pipefail
+          cd work
+          rm -rf chunks && mkdir -p chunks
+
+          shopt -s nullglob
+          mapfile -t files < <(ls -1 patched/*.deb | sort)
+          total="${#files[@]}"
+          echo ">>> Total patched debs: $total"
+          if [ "$total" -eq 0 ]; then
+            echo "::error::Nothing patched"; exit 1
+          fi
+
+          chunk_idx=0
+          i=0
+          for f in "${files[@]}"; do
+            if [ $((i % 1000)) -eq 0 ]; then
+              chunk_idx=$((chunk_idx + 1))
+              mkdir -p "chunks/part${chunk_idx}"
+            fi
+            cp -a "$f" "chunks/part${chunk_idx}/"
+            i=$((i + 1))
+          done
+
+          nchunks=$(ls -d chunks/part* 2>/dev/null | wc -l | tr -d ' ')
+          echo "chunks=$nchunks" >> "$GITHUB_OUTPUT"
+          echo "total=$total"     >> "$GITHUB_OUTPUT"
+          for d in chunks/part*; do
+            echo "  $d: $(ls -1 "$d" | wc -l) files, $(du -sh "$d" | cut -f1)"
+          done
+
+      - name: Create releases + upload chunks
+        if: steps.skipcheck.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          cd work
+
+          TS=$(date -u +'%Y.%m.%d-%H%M%S')
+          PFX="${TAG_PREFIX:-xodos}"
+          nchunks=${{ steps.chunks.outputs.chunks }}
+          total=${{ steps.chunks.outputs.total }}
+
+          for d in chunks/part*; do
+            part="${d##*part}"
+            tag="${PFX}-${REL_PREFIX}-p${part}-${TS}"
+            title="XoDos ${REPO_NAME} (part ${part}/${nchunks}) — ${TS}"
+
+            cat > /tmp/notes.md <<EOF
+          Patched Termux \`.deb\` packages for **${REPO_NAME}**.
+
+          - Source pool: \`${SRC_URL}\`
+          - Path patch: \`/data/data/com.termux\` → \`/data/data/app.xodos2\`
+          - Arch-independent pool (all ABI .debs included)
+          - Part **${part}/${nchunks}** — total patched this run: **${total}**
+          - Built by GitHub Actions run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          EOF
+
+            echo ">>> Creating release: $tag"
+            gh release create "$tag" \
+              --repo "$REPO" \
+              --title "$title" \
+              --notes-file /tmp/notes.md \
+              --target "${{ github.sha }}"
+
+            echo ">>> Uploading $d ($(ls -1 "$d"/*.deb | wc -l) files) to $tag"
+            mapfile -t files < <(ls -1 "$d"/*.deb | sort)
+            n="${#files[@]}"
+            i=0
+            failed=0
+
+            for f in "${files[@]}"; do
+              i=$((i + 1))
+              ok=0
+              for attempt in 1 2 3 4 5; do
+                if gh release upload "$tag" "$f" --repo "$REPO" --clobber 2>/tmp/gh_err.log; then
+                  ok=1; break
+                fi
+                if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
+                  backoff=$((attempt * 15))
+                else
+                  backoff=$((attempt * 3))
+                fi
+                sleep "$backoff"
+              done
+
+              if [ "$ok" -eq 1 ]; then
+                printf '\r  [%d/%d] ok   ' "$i" "$n"
+              else
+                echo ""
+                echo "  FAILED: $(basename "$f")"
+                sed -n '1,3p' /tmp/gh_err.log || true
+                failed=$((failed + 1))
+              fi
+              sleep 0.2
+            done
+            echo ""
+            echo ">>> $tag done: $((n - failed))/${n} uploaded, failed=$failed"
+            if [ "$failed" -gt 0 ]; then
+              echo "::warning::$failed upload(s) failed for $tag"
+            fi
+          done
+
+      - name: Summary
+        if: steps.skipcheck.outputs.skip == 'false'
+        run: |
+          {
+            echo "### $REPO_NAME"
+            echo ""
+            echo "- Source: \`$SRC_URL\`"
+            echo "- Patched debs: **${{ steps.chunks.outputs.total }}**"
+            echo "- Releases created: **${{ steps.chunks.outputs.chunks }}**"
+          } >> "$GITHUB_STEP_SUMMARY"

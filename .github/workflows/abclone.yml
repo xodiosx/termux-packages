@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       tag_prefix:
-        description: "Release tag prefix (final tag: <prefix>-<name>-p<N>-<ts>)"
+        description: "Release tag prefix"
         required: false
         default: "xodos"
       max_debs:
-        description: "Max debs per repo (0 = all). Use small number for a test run."
+        description: "Max debs per repo (0 = all)"
         required: false
         default: "0"
       skip:
-        description: "Space-separated repo names to skip (main x11 root glibc)"
+        description: "Space-separated repos to skip (main x11 root glibc)"
         required: false
         default: ""
 
@@ -32,18 +32,10 @@ jobs:
       max-parallel: 2
       matrix:
         include:
-          - name: main
-            url: https://packages-cf.termux.dev/apt/termux-main/pool/main/
-            release_prefix: XoDos-main
-          - name: x11
-            url: https://packages-cf.termux.dev/apt/termux-x11/pool/main/
-            release_prefix: XoDos-x11
-          - name: root
-            url: https://packages-cf.termux.dev/apt/termux-root/pool/stable/
-            release_prefix: XoDos-root
-          - name: glibc
-            url: https://packages-cf.termux.dev/apt/termux-glibc/pool/stable/
-            release_prefix: XoDos-glibc
+          - { name: main,  url: "https://packages-cf.termux.dev/apt/termux-main/pool/main/",   release_prefix: XoDos-main  }
+          - { name: x11,   url: "https://packages-cf.termux.dev/apt/termux-x11/pool/main/",    release_prefix: XoDos-x11   }
+          - { name: root,  url: "https://packages-cf.termux.dev/apt/termux-root/pool/stable/", release_prefix: XoDos-root  }
+          - { name: glibc, url: "https://packages-cf.termux.dev/apt/termux-glibc/pool/stable/",release_prefix: XoDos-glibc }
 
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -61,11 +53,7 @@ jobs:
         run: |
           set -euo pipefail
           for s in $SKIP_LIST; do
-            if [ "$s" = "$REPO_NAME" ]; then
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              echo ">>> Skipping $REPO_NAME (per input)"
-              exit 0
-            fi
+            [ "$s" = "$REPO_NAME" ] && { echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
           done
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
@@ -77,71 +65,163 @@ jobs:
         if: steps.skipcheck.outputs.skip == 'false'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq binutils xz-utils zstd dpkg-dev perl wget ca-certificates
+          sudo apt-get install -y -qq binutils xz-utils zstd dpkg-dev perl curl ca-certificates
 
-      # -----------------------------------------------------------------
-      # Recursive crawl + download.  wget walks:
-      #   pool/main/           (lvl 0)
-      #     a/                 (lvl 1)   ← single-char & lib* subdirs
-      #       alsa-lib/        (lvl 2)   ← package dirs
-      #         *.deb          (lvl 3)
+      # =================================================================
+      # STAGE 1 — Build the .deb URL list.
       #
-      #   -A '*.deb'    only fetch debs
-      #   -nH --cut-dirs=100   strip every server-side dir → flat into work/orig/
-      # -----------------------------------------------------------------
-      - name: Download all debs (recursive)
+      # Strategy:
+      #   A) The base dir itself may already contain .deb files (flat).
+      #   B) Otherwise it contains char folders: 0..9, a..z, liba..libz.
+      #      Each char folder contains package dirs; each package dir has .debs.
+      #   C) Some repos skip the char folder and directly contain package
+      #      dirs under the base — we handle that too.
+      # =================================================================
+      - name: Build .deb URL list
         if: steps.skipcheck.outputs.skip == 'false'
         run: |
           set -euo pipefail
           mkdir -p work/orig
+          : > work/deblist.txt
+          : > work/pkgdirs.txt
 
-          echo ">>> Crawling $SRC_URL"
-          wget \
-            --recursive \
-            --level=6 \
-            --no-parent \
-            --no-host-directories \
-            --cut-dirs=100 \
-            --accept='*.deb' \
-            --directory-prefix=work/orig \
-            --tries=5 --waitretry=3 --timeout=30 \
-            --no-verbose \
-            "$SRC_URL" 2>&1 | tail -40 || true
+          BASE="${SRC_URL%/}/"
 
-          # Some wget versions create work/orig/<host>/... even with -nH
-          # depending on redirects. Flatten just in case.
-          if [ -d "work/orig" ]; then
-            find work/orig -mindepth 2 -type f -name '*.deb' \
-              -exec mv -f {} work/orig/ \; 2>/dev/null || true
+          # ---- A) .debs directly under base ----------------------------
+          echo ">>> Checking base for flat .deb layout: $BASE"
+          curl -fsSL "$BASE" 2>/dev/null \
+            | grep -oE 'href="[^"]+\.deb"' \
+            | sed -E 's|href="||;s|"$||' \
+            | while read -r fn; do echo "$fn"; done >> work/deblist.txt || true
+          flat_count=$(wc -l < work/deblist.txt | tr -d ' ')
+          echo ">>> Flat .debs at base: $flat_count"
+
+          # ---- B) Enumerate char folders -------------------------------
+          CHAR_FOLDERS="0 1 2 3 4 5 6 7 8 9"
+          for c in a b c d e f g h i j k l m n o p q r s t u v w x y z; do
+            CHAR_FOLDERS="$CHAR_FOLDERS $c"
+          done
+          for c in a b c d e f g h i j k l m n o p q r s t u v w x y z; do
+            CHAR_FOLDERS="$CHAR_FOLDERS lib$c"
+          done
+
+          echo ">>> Enumerating $(echo $CHAR_FOLDERS | wc -w) char folders"
+
+          # For one char folder -> list package subdirs (one per line).
+          list_char() {
+            local c="$1"
+            local body
+            body="$(curl -fsSL "${BASE}${c}/" 2>/dev/null)" || return 0
+            # package subdirs are hrefs ending with "/" (excluding ../ ./ )
+            printf '%s\n' "$body" \
+              | grep -oE 'href="[^"]+/"' \
+              | sed -E 's|href="||;s|/$||' \
+              | grep -vE '^\.\.?$' \
+              | while read -r pkg; do
+                  echo "${c}/${pkg}"
+                done
+          }
+          export -f list_char
+          export BASE
+
+          printf '%s\n' $CHAR_FOLDERS \
+            | xargs -P 12 -I{} bash -c 'list_char "$@"' _ {} 2>/dev/null \
+            > work/char_pkgdirs.txt
+
+          sort -u work/char_pkgdirs.txt -o work/char_pkgdirs.txt
+          echo ">>> Package dirs from char folders: $(wc -l < work/char_pkgdirs.txt)"
+
+          # ---- C) Also check base for direct package subdirs -----------
+          # (some pools skip char folders entirely)
+          curl -fsSL "$BASE" 2>/dev/null \
+            | grep -oE 'href="[^"]+/"' \
+            | sed -E 's|href="||;s|/$||' \
+            | grep -vE '^\.\.?$' \
+            | grep -vE '^(0|1|2|3|4|5|6|7|8|9|[a-z]|lib[a-z])$' \
+            > work/base_pkgdirs.txt || true
+          echo ">>> Package dirs directly under base: $(wc -l < work/base_pkgdirs.txt)"
+
+          cat work/char_pkgdirs.txt work/base_pkgdirs.txt > work/pkgdirs.txt
+          sort -u work/pkgdirs.txt -o work/pkgdirs.txt
+          echo ">>> Total package dirs to scan: $(wc -l < work/pkgdirs.txt)"
+
+          if [ ! -s work/pkgdirs.txt ] && [ "$flat_count" -eq 0 ]; then
+            echo "::error::No package dirs and no flat .debs discovered at $BASE"
+            echo "--- head of base index ---"
+            curl -fsSL "$BASE" | head -40 || true
+            exit 1
           fi
 
-          got=$(find work/orig -maxdepth 1 -name '*.deb' | wc -l | tr -d ' ')
-          echo ">>> Downloaded: $got .deb files"
-          if [ "$got" -eq 0 ]; then
-            echo "::error::wget returned no .deb files for $REPO_NAME"
+          # ---- D) For each package dir, list .debs ---------------------
+          list_pkg() {
+            local pkgdir="$1"
+            local body
+            body="$(curl -fsSL "${BASE}${pkgdir}/" 2>/dev/null)" || return 0
+            printf '%s\n' "$body" \
+              | grep -oE 'href="[^"]+\.deb"' \
+              | sed -E 's|href="||;s|"$||' \
+              | while read -r fn; do
+                  echo "${pkgdir}/${fn}"
+                done
+          }
+          export -f list_pkg
+
+          if [ -s work/pkgdirs.txt ]; then
+            xargs -a work/pkgdirs.txt -P 16 -I{} bash -c 'list_pkg "$@"' _ {} 2>/dev/null \
+              >> work/deblist.txt
+          fi
+
+          sort -u work/deblist.txt -o work/deblist.txt
+          total=$(wc -l < work/deblist.txt | tr -d ' ')
+          echo ">>> Total unique .deb URLs: $total"
+          echo ">>> Sample:"
+          head -5 work/deblist.txt || true
+
+          if [ "$total" -eq 0 ]; then
+            echo "::error::Crawler found 0 .deb URLs for $REPO_NAME"
             exit 1
           fi
 
           if [ "$MAX_DEBS" != "0" ] && [ -n "$MAX_DEBS" ]; then
-            echo ">>> Limiting to first $MAX_DEBS"
-            # keep only first N, delete rest
-            find work/orig -maxdepth 1 -name '*.deb' -printf '%f\n' \
-              | sort | tail -n +$((MAX_DEBS + 1)) \
-              | while read -r f; do rm -f "work/orig/$f"; done
-            echo ">>> After limit: $(find work/orig -maxdepth 1 -name '*.deb' | wc -l | tr -d ' ')"
+            head -n "$MAX_DEBS" work/deblist.txt > work/deblist-ltd.txt
+            mv work/deblist-ltd.txt work/deblist.txt
+            echo ">>> Limited to first $MAX_DEBS"
           fi
 
+      # =================================================================
+      # STAGE 2 — Download all .debs (flat into work/orig/).
+      # =================================================================
+      - name: Download all debs
+        if: steps.skipcheck.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          BASE="${SRC_URL%/}/"
+
+          dl_one() {
+            local rel="$1"
+            local base
+            base="$(basename "$rel")"
+            [ -s "work/orig/$base" ] && return 0
+            if curl -fsSL --retry 3 --retry-delay 2 --max-time 300 \
+                    -o "work/orig/$base.tmp" "${BASE}${rel}"; then
+              mv "work/orig/$base.tmp" "work/orig/$base"
+            else
+              rm -f "work/orig/$base.tmp"
+              echo "FAIL: $rel" >&2
+            fi
+          }
+          export -f dl_one
+          export BASE
+
+          xargs -a work/deblist.txt -P 12 -I{} bash -c 'dl_one "$@"' _ {}
+
+          got=$(find work/orig -maxdepth 1 -name '*.deb' | wc -l | tr -d ' ')
+          echo ">>> Downloaded: $got .deb files"
           du -sh work/orig
 
-      # -----------------------------------------------------------------
-      # Patch each deb:
-      #   dpkg-deb -R   → temp dir with DEBIAN/ + data/data/com.termux/...
-      #   rename prefix → data/data/app.xodos2
-      #   perl -0777    → replace com.termux → app.xodos2 in every file
-      #                   (SAME LENGTH → safe on ELF binaries)
-      #   fix abs symlinks
-      #   dpkg-deb -b --root-owner-group → repack as root:root
-      # -----------------------------------------------------------------
+      # =================================================================
+      # STAGE 3 — Patch every deb in place.
+      # =================================================================
       - name: Patch every deb
         if: steps.skipcheck.outputs.skip == 'false'
         run: |
@@ -150,14 +230,12 @@ jobs:
           cat > /tmp/patch_one.sh <<'EOS'
           #!/bin/bash
           set -euo pipefail
-          src="$1"
-          dst="$2"
-
+          src="$1"; dst="$2"
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
 
           if ! dpkg-deb -R "$src" "$tmp" 2>/dev/null; then
-            echo "SKIP (cannot -R): $(basename "$src")" >&2
+            echo "SKIP (-R failed): $(basename "$src")" >&2
             exit 1
           fi
 
@@ -166,63 +244,48 @@ jobs:
             mv "$tmp/data/data/com.termux" "$tmp/data/data/app.xodos2"
           fi
 
-          # 2) Fix absolute symlinks pointing into the old prefix
+          # 2) Fix absolute symlinks into old prefix
           find "$tmp" -type l -print0 2>/dev/null \
             | while IFS= read -r -d '' link; do
                 target="$(readlink "$link" || true)"
                 case "$target" in
                   *com.termux*)
-                    new="${target//com.termux/app.xodos2}"
-                    ln -sfn "$new" "$link"
+                    ln -sfn "${target//com.termux/app.xodos2}" "$link"
                     ;;
                 esac
               done
 
-          # 3) Binary-safe content patch.  -0777 slurps whole file so
-          #    embedded NULs / CRLFs don't matter.  Length is preserved
-          #    (com.termux == app.xodos2 == 10 chars) so ELF offsets,
-          #    section sizes and relocations stay valid.
-          #    Batch many files per perl invocation for speed.
+          # 3) Binary-safe content patch. com.termux <-> app.xodos2 = 10 B
+          #    same length → ELF offsets preserved.
           find "$tmp" -type f -exec \
             perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' {} + 2>/dev/null || true
 
-          # 4) Repack as root:root without running as root
+          # 4) Repack as root:root without root
           if ! dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then
-            echo "SKIP (cannot -b): $(basename "$src")" >&2
+            echo "SKIP (-b failed): $(basename "$src")" >&2
             exit 1
           fi
-          exit 0
           EOS
           chmod +x /tmp/patch_one.sh
 
           mkdir -p work/patched
           cd work
 
-          echo ">>> Patching debs (parallel 4)…"
-          # Export so subshells see them
-          declare -a files
           mapfile -t files < <(find orig -maxdepth 1 -name '*.deb' -printf '%f\n' | sort)
-
           total="${#files[@]}"
           echo ">>> Total to patch: $total"
 
-          # Run in parallel; each worker patches and removes its source
-          patched_count_file=/tmp/patched.count
-          echo 0 > "$patched_count_file"
+          echo 0 > /tmp/patched.count
+          : > /tmp/patched.lock
 
           patch_and_count() {
             base="$1"
             if /tmp/patch_one.sh "orig/$base" "patched/$base"; then
               rm -f "orig/$base"
-              # atomic-ish increment
               {
                 flock 9
-                n=$(cat /tmp/patched.count)
-                n=$((n + 1))
-                echo "$n" > /tmp/patched.count
-                if [ $((n % 100)) -eq 0 ]; then
-                  echo ">>> patched $n/$total" >&2
-                fi
+                n=$(cat /tmp/patched.count); n=$((n + 1)); echo "$n" > /tmp/patched.count
+                [ $((n % 100)) -eq 0 ] && echo ">>> patched $n/$total" >&2
               } 9>/tmp/patched.lock
             fi
           }
@@ -232,15 +295,12 @@ jobs:
           printf '%s\n' "${files[@]}" \
             | xargs -P 4 -I{} bash -c 'patch_and_count "$@"' _ {}
 
-          ok=$(cat "$patched_count_file")
-          echo ">>> DONE: patched=$ok / total=$total"
-          echo ">>> Patched dir size:"
+          echo ">>> DONE: patched=$(cat /tmp/patched.count) / total=$total"
           du -sh patched
-          find patched -maxdepth 1 -name '*.deb' -printf '%f\n' | head -5
 
-      # -----------------------------------------------------------------
-      # Split into chunks of <= 1000 (GitHub hard limit per release).
-      # -----------------------------------------------------------------
+      # =================================================================
+      # STAGE 4 — Chunk ≤1000 assets per release (GitHub hard limit).
+      # =================================================================
       - name: Split into chunks
         if: steps.skipcheck.outputs.skip == 'false'
         id: chunks
@@ -251,13 +311,10 @@ jobs:
 
           mapfile -t files < <(find patched -maxdepth 1 -name '*.deb' -printf '%f\n' | sort)
           total="${#files[@]}"
-          echo ">>> Patched debs: $total"
-          if [ "$total" -eq 0 ]; then
-            echo "::error::Nothing patched"; exit 1
-          fi
+          echo ">>> Patched: $total"
+          [ "$total" -eq 0 ] && { echo "::error::Nothing patched"; exit 1; }
 
-          chunk_idx=0
-          i=0
+          chunk_idx=0; i=0
           for f in "${files[@]}"; do
             if [ $((i % 1000)) -eq 0 ]; then
               chunk_idx=$((chunk_idx + 1))
@@ -274,9 +331,9 @@ jobs:
             echo "  $d: $(find "$d" -name '*.deb' | wc -l) files, $(du -sh "$d" | cut -f1)"
           done
 
-      # -----------------------------------------------------------------
-      # Create one release per chunk and upload.
-      # -----------------------------------------------------------------
+      # =================================================================
+      # STAGE 5 — Create releases + upload.
+      # =================================================================
       - name: Create releases + upload
         if: steps.skipcheck.outputs.skip == 'false'
         run: |
@@ -297,10 +354,11 @@ jobs:
           Patched Termux \`.deb\` packages for **${REPO_NAME}**.
 
           - Source pool: \`${SRC_URL}\`
-          - Prefix patch: \`/data/data/com.termux\` → \`/data/data/app.xodos2\`
-          - Applied inside files (binary-safe) and to the on-disk tree, then repacked with \`dpkg-deb --root-owner-group -b\`
+          - Patch: \`/data/data/com.termux\` → \`/data/data/app.xodos2\` (on-disk tree,
+            symlink targets, and file contents via binary-safe \`perl -0777\`)
+          - Repacked with \`dpkg-deb --root-owner-group -b\`
           - Part **${part}/${nchunks}** — total patched this run: **${total}**
-          - Built by GitHub Actions run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - Built by run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
           EOF
 
             echo ">>> Creating release: $tag"
@@ -343,9 +401,7 @@ jobs:
             done
 
             echo ">>> $tag done: $((n - failed))/${n} uploaded, failed=$failed"
-            if [ "$failed" -gt 0 ]; then
-              echo "::warning::$failed upload(s) failed for $tag"
-            fi
+            [ "$failed" -gt 0 ] && echo "::warning::$failed upload(s) failed for $tag"
           done
 
       - name: Summary

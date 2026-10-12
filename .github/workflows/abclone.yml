@@ -72,7 +72,7 @@ jobs:
           sudo apt-get install -y -qq binutils xz-utils zstd dpkg-dev perl curl ca-certificates
 
       # ==========================================================
-      # CRAWL  (identical logic to the local script you tested)
+      # STAGE 1 — CRAWL
       # ==========================================================
       - name: Crawl pool for .deb URLs
         if: steps.skipcheck.outputs.skip == 'false'
@@ -157,16 +157,15 @@ jobs:
           echo ">>> first 5 URLs:"; head -5 work/deblist.txt
 
       # ==========================================================
-      # DOWNLOAD + PATCH  (interleaved; each worker self-contained)
+      # STAGE 2 — DOWNLOAD + PATCH (interleaved, per-worker)
       # ==========================================================
-      - name: Download + patch (interleaved)
+      - name: Download + patch
         if: steps.skipcheck.outputs.skip == 'false'
         run: |
           set -euo pipefail
           BASE="${SRC_URL%/}/"
           mkdir -p work/patched work/tmp
 
-          # ---------- patcher ----------
           cat > /tmp/patch_one.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -177,16 +176,17 @@ jobs:
           dpkg-deb -R "$src" "$tmp" 2>/dev/null \
             || { echo "SKIP -R: $(basename "$src")" >&2; exit 1; }
 
-          # on-disk prefix tree
-          [ -d "$tmp/data/data/com.termux" ] && mv "$tmp/data/data/com.termux" "$tmp/data/data/app.xodos2"
+          # On-disk prefix tree
+          [ -d "$tmp/data/data/com.termux" ] && \
+            mv "$tmp/data/data/com.termux" "$tmp/data/data/app.xodos2"
 
-          # absolute symlink targets
+          # Absolute symlink targets
           find "$tmp" -type l -print0 2>/dev/null | while IFS= read -r -d '' link; do
             t="$(readlink "$link" 2>/dev/null || true)"
             case "$t" in *com.termux*) ln -sfn "${t//com.termux/app.xodos2}" "$link" ;; esac
           done
 
-          # binary-safe content patch — com.termux == app.xodos2 == 10 bytes
+          # Binary-safe content patch — com.termux == app.xodos2 == 10 bytes
           find "$tmp" -type f -exec \
             perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' {} + 2>/dev/null || true
 
@@ -195,7 +195,6 @@ jobs:
           EOS
           chmod +x /tmp/patch_one.sh
 
-          # ---------- worker ----------
           cat > /tmp/dl_and_patch.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -219,6 +218,7 @@ jobs:
           else
             rm -f "$tmpfile" "$outfile"
           fi
+          exit 0
           EOS
           chmod +x /tmp/dl_and_patch.sh
 
@@ -233,7 +233,7 @@ jobs:
           du -sh work/patched
 
       # ==========================================================
-      # CHUNK ≤1000 assets / release  (GitHub hard limit)
+      # STAGE 3 — CHUNK (≤1000 assets per release, GitHub hard cap)
       # ==========================================================
       - name: Chunk into ≤1000 assets per release
         if: steps.skipcheck.outputs.skip == 'false'
@@ -246,7 +246,10 @@ jobs:
           mapfile -t files < <(find patched -maxdepth 1 -name '*.deb' -printf '%f\n' | sort)
           total="${#files[@]}"
           echo ">>> patched: $total"
-          [ "$total" -eq 0 ] && { echo "::error::Nothing patched"; exit 1; }
+          if [ "$total" -eq 0 ]; then
+            echo "::error::Nothing patched"
+            exit 1
+          fi
 
           chunk_idx=0; i=0
           for f in "${files[@]}"; do
@@ -266,7 +269,7 @@ jobs:
           done
 
       # ==========================================================
-      # RELEASE + UPLOAD  (with exponential backoff)
+      # STAGE 4 — RELEASE + UPLOAD  (fixed exit status)
       # ==========================================================
       - name: Create releases + upload
         if: steps.skipcheck.outputs.skip == 'false'
@@ -321,7 +324,9 @@ jobs:
               done
 
               if [ "$ok" -eq 1 ]; then
-                [ $((i % 50)) -eq 0 ] || [ "$i" -eq "$n" ] && echo "  [$i/$n] uploaded"
+                if [ $((i % 50)) -eq 0 ] || [ "$i" -eq "$n" ]; then
+                  echo "  [$i/$n] uploaded"
+                fi
               else
                 echo "  FAILED: $(basename "$f")"
                 sed -n '1,3p' /tmp/gh_err.log || true
@@ -331,8 +336,12 @@ jobs:
             done
 
             echo ">>> $tag: $((n - failed))/${n} uploaded, failed=$failed"
-            [ "$failed" -gt 0 ] && echo "::warning::$failed upload(s) failed for $tag"
+            if [ "$failed" -gt 0 ]; then
+              echo "::warning::$failed upload(s) failed for $tag"
+            fi
           done
+
+          exit 0
 
       - name: Summary
         if: steps.skipcheck.outputs.skip == 'false'

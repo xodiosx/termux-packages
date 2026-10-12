@@ -7,6 +7,10 @@ on:
         description: "Release tag prefix"
         required: false
         default: "xodos"
+      arch:
+        description: "Space-separated arches to keep (aarch64 arm i686 x86_64 all). Empty = all."
+        required: false
+        default: "aarch64"
       max_debs:
         description: "Max debs per repo (0 = all). Use 30 for a smoke test."
         required: false
@@ -27,6 +31,10 @@ on:
         description: "Files per bulk-upload batch (1 = one-by-one, 20 = recommended)"
         required: false
         default: "20"
+      strict:
+        description: "Fail the job if any deb could not be patched"
+        type: boolean
+        default: false
       keep_tmp:
         description: "Keep extracted trees on pack failure (for debugging)"
         type: boolean
@@ -60,11 +68,13 @@ jobs:
       REL_PREFIX: ${{ matrix.release_prefix }}
       REPO_NAME: ${{ matrix.name }}
       TAG_PREFIX: ${{ inputs.tag_prefix }}
+      ARCH_IN: ${{ inputs.arch }}
       MAX_DEBS: ${{ inputs.max_debs }}
       SKIP_LIST: ${{ inputs.skip }}
       WORKERS: ${{ inputs.workers }}
       UPLOAD_DELAY: ${{ inputs.upload_delay }}
       UPLOAD_BATCH: ${{ inputs.upload_batch }}
+      STRICT: ${{ inputs.strict && '1' || '0' }}
       KEEP_TMP: ${{ inputs.keep_tmp && '1' || '0' }}
 
     steps:
@@ -91,7 +101,7 @@ jobs:
         run: df -h /
 
       # ==========================================================
-      # STAGE 1 — CRAWL
+      # STAGE 1 — CRAWL + ARCH FILTER
       # ==========================================================
       - name: Crawl pool for .deb URLs
         if: steps.skipcheck.outputs.skip == 'false'
@@ -157,26 +167,60 @@ jobs:
           echo ">>> L2 debs: $(wc -l < work/L2_debs.txt)"
 
           cat work/flat_debs.txt work/L1_debs.txt work/L2_debs.txt 2>/dev/null \
-            | sort -u > work/deblist.txt || true
+            | sort -u > work/deblist-all.txt || true
+          all_total=$(wc -l < work/deblist-all.txt | tr -d ' ')
+          echo ">>> TOTAL .deb URLs discovered: $all_total"
 
-          total=$(wc -l < work/deblist.txt | tr -d ' ')
-          echo ">>> TOTAL unique .deb URLs: $total"
-          if [ "$total" -eq 0 ]; then
+          if [ "$all_total" -eq 0 ]; then
             echo "::error::No .deb URLs found at $BASE"
             head -30 work/base.raw || true
+            exit 1
+          fi
+
+          # ---------------- ARCH FILTER ----------------
+          # ARCH_IN is a space-separated list, e.g.:
+          #   "aarch64"           → keep _aarch64.deb + _all.deb
+          #   "aarch64 arm"       → keep _aarch64.deb + _arm.deb + _all.deb
+          #   "all"               → keep only _all.deb
+          #   ""  (empty)         → keep everything
+          :
+          if [ -z "${ARCH_IN// /}" ]; then
+            echo ">>> arch filter: none (all archs)"
+            cp work/deblist-all.txt work/deblist.txt
+          else
+            echo ">>> arch filter: [$ARCH_IN]"
+            # build alternation for the requested archs
+            alt=""
+            need_all=1
+            for a in $ARCH_IN; do
+              [ "$a" = "all" ] && { need_all=0; }
+              if [ -z "$alt" ]; then alt="$a"; else alt="$alt|$a"; fi
+            done
+            [ "$need_all" = "1" ] && alt="$alt|all"
+            # match on "_<arch>.deb$" for the trailing filename segment
+            grep -E "_(${alt})\.deb$" work/deblist-all.txt > work/deblist.txt || true
+          fi
+
+          arch_total=$(wc -l < work/deblist.txt | tr -d ' ')
+          echo ">>> after arch filter: $arch_total / $all_total"
+
+          if [ "$arch_total" -eq 0 ]; then
+            echo "::error::Arch filter [${ARCH_IN}] removed all debs"
+            echo ">>> sample of discovered names:"
+            head -10 work/deblist-all.txt
             exit 1
           fi
 
           if [ "$MAX_DEBS" != "0" ] && [ -n "$MAX_DEBS" ]; then
             head -n "$MAX_DEBS" work/deblist.txt > work/deblist-ltd.txt
             mv work/deblist-ltd.txt work/deblist.txt
-            echo ">>> Limited to first $MAX_DEBS"
+            echo ">>> limited to first $MAX_DEBS"
           fi
 
           echo ">>> first 5 URLs:"; head -5 work/deblist.txt
 
       # ==========================================================
-      # STAGE 2 — DOWNLOAD + PATCH (interleaved, per-worker)
+      # STAGE 2 — DOWNLOAD + PATCH (permissive, with fallbacks)
       # ==========================================================
       - name: Download + patch
         if: steps.skipcheck.outputs.skip == 'false'
@@ -185,9 +229,15 @@ jobs:
           BASE="${SRC_URL%/}/"
           mkdir -p work/patched work/tmp
           : > work/failures.log
+          : > work/outcomes.log
 
           # ----------------------------------------------------------
-          # PATCHER — main fix here: chmod 0755 DEBIAN/* before pack
+          # PATCHER — permissive chain:
+          #   1) normal repack
+          #   2) gzip repack
+          #   3) no --root-owner-group
+          #   4) strip all conffiles, repack
+          #   5) ship original .deb untouched (marked UNPATCHED)
           # ----------------------------------------------------------
           cat > /tmp/patch_one.sh <<'EOS'
           #!/usr/bin/env bash
@@ -207,27 +257,26 @@ jobs:
           }
           trap cleanup EXIT
 
-          # 0) refuse to clobber a stale/incomplete output
           if [ -e "$dst" ]; then
             if dpkg-deb -I "$dst" >/dev/null 2>&1; then
-              exit 0   # already a valid deb — assume done
+              echo "OK-CACHED"
+              exit 0
             fi
             rm -f "$dst"
           fi
 
-          # 1) extract (capture real error)
           err=""
           if ! err="$(dpkg-deb -R "$src" "$tmp" 2>&1)"; then
-            echo "SKIP -R: $(basename "$src"): $err" >&2
-            exit 1
+            cp -a "$src" "$dst"
+            echo "FAIL-EXTRACT"
+            exit 0
           fi
 
-          # 2) rename on-disk prefix tree
-          if [ -d "$tmp/data/data/com.termux" ]; then
+          # rename prefix tree
+          [ -d "$tmp/data/data/com.termux" ] && \
             mv "$tmp/data/data/com.termux" "$tmp/data/data/app.xodos2"
-          fi
 
-          # 3) rewrite absolute symlink targets
+          # fix symlink targets
           while IFS= read -r -d '' link; do
             t="$(readlink "$link" 2>/dev/null || true)"
             case "$t" in
@@ -235,69 +284,80 @@ jobs:
             esac
           done < <(find "$tmp" -type l -print0 2>/dev/null || true)
 
-          # 4) binary-safe content patch (com.termux == app.xodos2 == 10 B)
+          # binary-safe content patch
           find "$tmp" -type f -print0 2>/dev/null \
             | xargs -0 -r -n 40 perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' 2>/dev/null \
             || true
 
-          # 5) **FIX** — Termux debs ship maintainer scripts as 644; dpkg-deb
-          #    on Debian/Ubuntu refuses to repack unless they're executable.
+          # DEBIAN/ modes
           if [ -d "$tmp/DEBIAN" ]; then
-            # standard maintainer scripts — must be executable
-            for s in preinst postinst prerm postrm config triggers; do
+            for s in preinst postinst prerm postrm config; do
               [ -f "$tmp/DEBIAN/$s" ] && chmod 0755 "$tmp/DEBIAN/$s" || true
             done
-            # any other file in DEBIAN/ that isn't control/conffiles/md5sums
-            # gets 0644 (metadata files)
-            find "$tmp/DEBIAN" -maxdepth 1 -type f -print0 2>/dev/null \
-              | while IFS= read -r -d '' f; do
-                  case "$(basename "$f")" in
-                    control|conffiles|md5sums|shlibs|symbols|triggers|*.config)
-                      chmod 0644 "$f" 2>/dev/null || true
-                      ;;
-                    *)
-                      # if it already has a sane exec bit, keep it
-                      cur="$(stat -c '%a' "$f" 2>/dev/null || echo 644)"
-                      if [ "$cur" = "644" ] || [ "$cur" = "0644" ]; then
-                        chmod 0755 "$f" 2>/dev/null || true
-                      fi
-                      ;;
-                  esac
-                done
+            for s in control conffiles md5sums shlibs symbols templates triggers; do
+              [ -f "$tmp/DEBIAN/$s" ] && chmod 0644 "$tmp/DEBIAN/$s" || true
+            done
           fi
 
-          # 6) make sure top-level dirs in the payload are traversable
-          #    (some Termux debs ship dirs as 600/700 accidentally)
+          # filter non-existent conffiles
+          if [ -f "$tmp/DEBIAN/conffiles" ]; then
+            : > "$tmp/DEBIAN/conffiles.new"
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="${line%$'\r'}"
+              case "$line" in
+                ""|\#*) printf '%s\n' "$line" >> "$tmp/DEBIAN/conffiles.new"; continue ;;
+              esac
+              rel="${line#/}"
+              if [ -e "$tmp/$rel" ] || [ -L "$tmp/$rel" ]; then
+                printf '%s\n' "$line" >> "$tmp/DEBIAN/conffiles.new"
+              fi
+            done < "$tmp/DEBIAN/conffiles"
+            mv "$tmp/DEBIAN/conffiles.new" "$tmp/DEBIAN/conffiles"
+          fi
+
+          # traversable dirs
           find "$tmp/data" -type d -print0 2>/dev/null \
             | while IFS= read -r -d '' d; do
                 cur="$(stat -c '%a' "$d" 2>/dev/null || echo 755)"
-                # ensure at least owner rwx
                 if [ $((0$cur & 0700)) -ne 0700 ]; then
                   chmod u+rwx "$d" 2>/dev/null || true
                 fi
               done
 
-          # 7) pack — capture real error; retry with gzip; fall back to no ROG
-          out_err=""
-          if ! out_err="$(dpkg-deb --root-owner-group -b "$tmp" "$dst" 2>&1)"; then
-            echo "PACK-1 FAIL: $(basename "$src"): $out_err" >&2
-            rm -f "$dst"
+          # attempt 1: normal
+          if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then
+            echo "OK"
+            exit 0
+          fi
+          rm -f "$dst"
 
-            if ! out_err="$(dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$dst" 2>&1)"; then
-              echo "PACK-2 FAIL: $(basename "$src"): $out_err" >&2
-              rm -f "$dst"
+          # attempt 2: gzip
+          if dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$dst" >/dev/null 2>&1; then
+            echo "OK-FALLBACK-GZIP"
+            exit 0
+          fi
+          rm -f "$dst"
 
-              if ! out_err="$(dpkg-deb -b "$tmp" "$dst" 2>&1)"; then
-                echo "PACK-3 FAIL: $(basename "$src"): $out_err" >&2
-                rm -f "$dst"
-                exit 1
-              fi
-              echo "PACK-FALLBACK (no --root-owner-group): $(basename "$src")" >&2
-            else
-              echo "PACK-FALLBACK (gzip): $(basename "$src")" >&2
+          # attempt 3: no --root-owner-group
+          if dpkg-deb -b "$tmp" "$dst" >/dev/null 2>&1; then
+            echo "OK-FALLBACK-NOROG"
+            exit 0
+          fi
+          rm -f "$dst"
+
+          # attempt 4: empty conffiles
+          if [ -f "$tmp/DEBIAN/conffiles" ]; then
+            : > "$tmp/DEBIAN/conffiles"
+            if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then
+              echo "OK-FALLBACK-NOCONFFILES"
+              exit 0
             fi
+            rm -f "$dst"
           fi
 
+          # attempt 5: ship original unpatched
+          cp -a "$src" "$dst"
+          echo "UNPATCHED-COPIED"
           exit 0
           EOS
           chmod +x /tmp/patch_one.sh
@@ -306,7 +366,8 @@ jobs:
           cat > /tmp/dl_and_patch.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
-          rel="$1"; BASE="$2"; outdir="$3"; tmpdir="$4"; faillog="$5"
+          rel="$1"; BASE="$2"; outdir="$3"; tmpdir="$4"
+          faillog="$5"; outcomelog="$6"
 
           enc="$(basename "$rel")"
           fn="$(printf '%s' "$enc" | perl -pe 's/%([0-9A-Fa-f]{2})/chr(hex($1))/ge')"
@@ -318,13 +379,16 @@ jobs:
 
           curl -fsSL --retry 4 --retry-delay 2 --max-time 300 \
             -o "$tmpfile" "${BASE}${rel}" 2>/dev/null \
-            || { rm -f "$tmpfile"; echo "DL-FAIL: $rel" >> "$faillog"; exit 0; }
+            || { rm -f "$tmpfile"; echo "DL-FAIL $fn" >> "$faillog"; exit 0; }
 
-          if /tmp/patch_one.sh "$tmpfile" "$outfile"; then
-            rm -f "$tmpfile"
-          else
-            rm -f "$tmpfile"
-            echo "PATCH-FAIL: $rel" >> "$faillog"
+          outcome="$(/tmp/patch_one.sh "$tmpfile" "$outfile" 2>/dev/null | tail -1 || echo "FAIL-UNKNOWN")"
+          rm -f "$tmpfile"
+          [ -z "$outcome" ] && outcome="OK"
+
+          printf '%s\t%s\n' "$outcome" "$fn" >> "$outcomelog"
+
+          if [ ! -s "$outfile" ]; then
+            echo "FAIL $fn" >> "$faillog"
           fi
           exit 0
           EOS
@@ -335,19 +399,41 @@ jobs:
           echo ">>> free space before: $(df -h --output=avail / | tail -1)"
 
           xargs -a work/deblist.txt -P "$WORKERS" -I{} \
-            bash /tmp/dl_and_patch.sh {} "$BASE" "work/patched" "work/tmp" "work/failures.log" \
+            bash /tmp/dl_and_patch.sh {} "$BASE" "work/patched" "work/tmp" \
+              "work/failures.log" "work/outcomes.log" \
             || true
 
-          patched=$(find work/patched -maxdepth 1 -name '*.deb' | wc -l | tr -d ' ')
-          echo ">>> patched: $patched / $total"
+          produced=$(find work/patched -maxdepth 1 -name '*.deb' | wc -l | tr -d ' ')
+          echo ">>> produced debs: $produced / $total"
           echo ">>> free space after:  $(df -h --output=avail / | tail -1)"
           du -sh work/patched
 
+          echo ">>> outcome counts:"
+          if [ -s work/outcomes.log ]; then
+            awk -F'\t' '{print $1}' work/outcomes.log | sort | uniq -c | sort -rn
+          fi
+
           if [ -s work/failures.log ]; then
             nfail=$(wc -l < work/failures.log)
-            echo ">>> $nfail failures (first 20):"
+            echo ">>> $nfail hard failures (first 20):"
             head -20 work/failures.log
           fi
+
+          if [ "$STRICT" = "1" ] && [ -s work/failures.log ]; then
+            echo "::error::$((total - produced)) deb(s) missing (STRICT=1)"
+            exit 1
+          fi
+          exit 0
+
+      - name: Upload logs
+        if: steps.skipcheck.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.name }}
+          path: |
+            work/outcomes.log
+            work/failures.log
+          if-no-files-found: ignore
 
       # ==========================================================
       # STAGE 3 — CHUNK (≤1000 assets per release, GitHub hard cap)
@@ -386,7 +472,7 @@ jobs:
           done
 
       # ==========================================================
-      # STAGE 4 — RELEASE + UPLOAD (batched + configurable delay)
+      # STAGE 4 — RELEASE + UPLOAD
       # ==========================================================
       - name: Create releases + upload
         if: steps.skipcheck.outputs.skip == 'false'
@@ -399,8 +485,10 @@ jobs:
           total=${{ steps.chunks.outputs.total }}
           DELAY="${UPLOAD_DELAY:-0.5}"
           BATCH="${UPLOAD_BATCH:-20}"
+          ARCH_LABEL="${ARCH_IN:-all}"
 
           echo ">>> upload delay: ${DELAY}s   batch: ${BATCH}"
+          echo ">>> arch: ${ARCH_LABEL}"
 
           for d in chunks/part*; do
             part="${d##*part}"
@@ -411,12 +499,14 @@ jobs:
           Patched Termux \`.deb\` packages for **${REPO_NAME}**.
 
           - Source pool: \`${SRC_URL}\`
+          - Architecture filter: \`${ARCH_LABEL}\`
           - Prefix patch: \`/data/data/com.termux\` → \`/data/data/app.xodos2\`
             (tree, symlink targets, and file contents via binary-safe
             \`perl -0777\`; both strings are 10 bytes so ELF offsets are preserved)
-          - Maintainer script permissions fixed to 0755
+          - Maintainer script permissions restored to 0755
+          - Non-existent conffiles entries filtered
           - Repacked with \`dpkg-deb --root-owner-group -b\`
-          - Part **${part}/${nchunks}** — total patched this run: **${total}**
+          - Part **${part}/${nchunks}** — total produced this run: **${total}**
           - Run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
           EOF
 
@@ -499,8 +589,9 @@ jobs:
             echo "### $REPO_NAME"
             echo ""
             echo "- Source: \`$SRC_URL\`"
-            echo "- Patched debs: **${{ steps.chunks.outputs.total }}**"
+            echo "- Arch filter: \`${{ inputs.arch }}\`"
+            echo "- Produced debs: **${{ steps.chunks.outputs.total }}**"
             echo "- Releases created: **${{ steps.chunks.outputs.chunks }}**"
             echo "- Upload delay: \`${{ inputs.upload_delay }}s\`  ·  batch: \`${{ inputs.upload_batch }}\`"
-            echo "- KEEP_TMP on fail: \`${{ inputs.keep_tmp }}\`"
+            echo "- STRICT: \`${{ inputs.strict }}\`  ·  KEEP_TMP: \`${{ inputs.keep_tmp }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

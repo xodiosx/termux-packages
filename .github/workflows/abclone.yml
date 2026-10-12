@@ -186,7 +186,9 @@ jobs:
           mkdir -p work/patched work/tmp
           : > work/failures.log
 
-          # ---------- patcher ----------
+          # ----------------------------------------------------------
+          # PATCHER — main fix here: chmod 0755 DEBIAN/* before pack
+          # ----------------------------------------------------------
           cat > /tmp/patch_one.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -238,19 +240,53 @@ jobs:
             | xargs -0 -r -n 40 perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' 2>/dev/null \
             || true
 
-          # 5) pack — capture real error, retry with different compression,
-          #    fall back without --root-owner-group
+          # 5) **FIX** — Termux debs ship maintainer scripts as 644; dpkg-deb
+          #    on Debian/Ubuntu refuses to repack unless they're executable.
+          if [ -d "$tmp/DEBIAN" ]; then
+            # standard maintainer scripts — must be executable
+            for s in preinst postinst prerm postrm config triggers; do
+              [ -f "$tmp/DEBIAN/$s" ] && chmod 0755 "$tmp/DEBIAN/$s" || true
+            done
+            # any other file in DEBIAN/ that isn't control/conffiles/md5sums
+            # gets 0644 (metadata files)
+            find "$tmp/DEBIAN" -maxdepth 1 -type f -print0 2>/dev/null \
+              | while IFS= read -r -d '' f; do
+                  case "$(basename "$f")" in
+                    control|conffiles|md5sums|shlibs|symbols|triggers|*.config)
+                      chmod 0644 "$f" 2>/dev/null || true
+                      ;;
+                    *)
+                      # if it already has a sane exec bit, keep it
+                      cur="$(stat -c '%a' "$f" 2>/dev/null || echo 644)"
+                      if [ "$cur" = "644" ] || [ "$cur" = "0644" ]; then
+                        chmod 0755 "$f" 2>/dev/null || true
+                      fi
+                      ;;
+                  esac
+                done
+          fi
+
+          # 6) make sure top-level dirs in the payload are traversable
+          #    (some Termux debs ship dirs as 600/700 accidentally)
+          find "$tmp/data" -type d -print0 2>/dev/null \
+            | while IFS= read -r -d '' d; do
+                cur="$(stat -c '%a' "$d" 2>/dev/null || echo 755)"
+                # ensure at least owner rwx
+                if [ $((0$cur & 0700)) -ne 0700 ]; then
+                  chmod u+rwx "$d" 2>/dev/null || true
+                fi
+              done
+
+          # 7) pack — capture real error; retry with gzip; fall back to no ROG
           out_err=""
           if ! out_err="$(dpkg-deb --root-owner-group -b "$tmp" "$dst" 2>&1)"; then
             echo "PACK-1 FAIL: $(basename "$src"): $out_err" >&2
             rm -f "$dst"
 
-            # try gzip (some debs use zstd/xz which older dpkg-deb can't re-emit)
             if ! out_err="$(dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$dst" 2>&1)"; then
               echo "PACK-2 FAIL: $(basename "$src"): $out_err" >&2
               rm -f "$dst"
 
-              # last resort: no --root-owner-group
               if ! out_err="$(dpkg-deb -b "$tmp" "$dst" 2>&1)"; then
                 echo "PACK-3 FAIL: $(basename "$src"): $out_err" >&2
                 rm -f "$dst"
@@ -309,7 +345,7 @@ jobs:
 
           if [ -s work/failures.log ]; then
             nfail=$(wc -l < work/failures.log)
-            echo ">>> $nfail failures:"
+            echo ">>> $nfail failures (first 20):"
             head -20 work/failures.log
           fi
 
@@ -378,6 +414,7 @@ jobs:
           - Prefix patch: \`/data/data/com.termux\` → \`/data/data/app.xodos2\`
             (tree, symlink targets, and file contents via binary-safe
             \`perl -0777\`; both strings are 10 bytes so ELF offsets are preserved)
+          - Maintainer script permissions fixed to 0755
           - Repacked with \`dpkg-deb --root-owner-group -b\`
           - Part **${part}/${nchunks}** — total patched this run: **${total}**
           - Run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})

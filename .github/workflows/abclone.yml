@@ -19,6 +19,14 @@ on:
         description: "Parallel download+patch workers (6 recommended)"
         required: false
         default: "6"
+      upload_delay:
+        description: "Seconds between uploads (0.15 fast, 0.5 safe, 1.0 very safe)"
+        required: false
+        default: "0.5"
+      upload_batch:
+        description: "Files per bulk-upload batch (1 = one-by-one, 20 = recommended)"
+        required: false
+        default: "20"
 
 permissions:
   contents: write
@@ -51,6 +59,8 @@ jobs:
       MAX_DEBS: ${{ inputs.max_debs }}
       SKIP_LIST: ${{ inputs.skip }}
       WORKERS: ${{ inputs.workers }}
+      UPLOAD_DELAY: ${{ inputs.upload_delay }}
+      UPLOAD_BATCH: ${{ inputs.upload_batch }}
 
     steps:
       - name: Skip check
@@ -269,7 +279,7 @@ jobs:
           done
 
       # ==========================================================
-      # STAGE 4 — RELEASE + UPLOAD  (fixed exit status)
+      # STAGE 4 — RELEASE + UPLOAD  (with batching + configurable delay)
       # ==========================================================
       - name: Create releases + upload
         if: steps.skipcheck.outputs.skip == 'false'
@@ -280,6 +290,10 @@ jobs:
           PFX="${TAG_PREFIX:-xodos}"
           nchunks=${{ steps.chunks.outputs.chunks }}
           total=${{ steps.chunks.outputs.total }}
+          DELAY="${UPLOAD_DELAY:-0.5}"
+          BATCH="${UPLOAD_BATCH:-20}"
+
+          echo ">>> upload delay: ${DELAY}s   batch: ${BATCH}"
 
           for d in chunks/part*; do
             part="${d##*part}"
@@ -305,34 +319,65 @@ jobs:
 
             mapfile -t files < <(find "$d" -maxdepth 1 -name '*.deb' -printf '%p\n' | sort)
             n="${#files[@]}"
-            echo ">>> uploading $n files to $tag"
+            echo ">>> uploading $n files to $tag (batch=$BATCH delay=${DELAY}s)"
             i=0; failed=0
 
-            for f in "${files[@]}"; do
-              i=$((i + 1))
-              ok=0
+            # ---- Batched upload with per-file fallback ----
+            while [ "$i" -lt "$n" ]; do
+              batch_end=$((i + BATCH))
+              [ "$batch_end" -gt "$n" ] && batch_end="$n"
+              batch=( "${files[@]:i:batch_end-i}" )
+
+              uploaded_batch=0
               for attempt in 1 2 3 4 5; do
-                if gh release upload "$tag" "$f" --repo "$REPO" --clobber 2>/tmp/gh_err.log; then
-                  ok=1; break
+                if gh release upload "$tag" "${batch[@]}" --repo "$REPO" --clobber \
+                     2>/tmp/gh_err.log; then
+                  uploaded_batch=1
+                  break
                 fi
                 if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
-                  backoff=$((attempt * 15))
+                  backoff=$((attempt * 20))
                 else
-                  backoff=$((attempt * 3))
+                  backoff=$((attempt * 4))
                 fi
+                echo "  batch retry $attempt in ${backoff}s…"
                 sleep "$backoff"
               done
 
-              if [ "$ok" -eq 1 ]; then
-                if [ $((i % 50)) -eq 0 ] || [ "$i" -eq "$n" ]; then
-                  echo "  [$i/$n] uploaded"
-                fi
+              if [ "$uploaded_batch" -eq 1 ]; then
+                i="$batch_end"
+                echo "  [$i/$n] uploaded (batch)"
               else
-                echo "  FAILED: $(basename "$f")"
-                sed -n '1,3p' /tmp/gh_err.log || true
-                failed=$((failed + 1))
+                # Fallback: one-by-one for this batch
+                echo "  batch failed, falling back to per-file…"
+                for f in "${batch[@]}"; do
+                  ok=0
+                  for attempt in 1 2 3 4 5; do
+                    if gh release upload "$tag" "$f" --repo "$REPO" --clobber \
+                         2>/tmp/gh_err.log; then
+                      ok=1; break
+                    fi
+                    if grep -qiE 'secondary rate limit|abuse|rate limit' /tmp/gh_err.log; then
+                      backoff=$((attempt * 15))
+                    else
+                      backoff=$((attempt * 3))
+                    fi
+                    sleep "$backoff"
+                  done
+                  if [ "$ok" -eq 1 ]; then
+                    :
+                  else
+                    echo "  FAILED: $(basename "$f")"
+                    sed -n '1,3p' /tmp/gh_err.log || true
+                    failed=$((failed + 1))
+                  fi
+                  sleep "$DELAY"
+                done
+                i="$batch_end"
+                echo "  [$i/$n] uploaded (fallback)"
               fi
-              sleep 0.15
+
+              sleep "$DELAY"
             done
 
             echo ">>> $tag: $((n - failed))/${n} uploaded, failed=$failed"
@@ -352,4 +397,5 @@ jobs:
             echo "- Source: \`$SRC_URL\`"
             echo "- Patched debs: **${{ steps.chunks.outputs.total }}**"
             echo "- Releases created: **${{ steps.chunks.outputs.chunks }}**"
+            echo "- Upload delay: \`${{ inputs.upload_delay }}s\`  ·  batch: \`${{ inputs.upload_batch }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

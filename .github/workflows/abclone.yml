@@ -20,13 +20,17 @@ on:
         required: false
         default: "6"
       upload_delay:
-        description: "Seconds between uploads (0.15 fast, 0.5 safe, 1.0 very safe)"
+        description: "Seconds between upload batches (0.15 fast, 0.5 safe, 1.0 very safe)"
         required: false
         default: "0.5"
       upload_batch:
         description: "Files per bulk-upload batch (1 = one-by-one, 20 = recommended)"
         required: false
         default: "20"
+      keep_tmp:
+        description: "Keep extracted trees on pack failure (for debugging)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -61,6 +65,7 @@ jobs:
       WORKERS: ${{ inputs.workers }}
       UPLOAD_DELAY: ${{ inputs.upload_delay }}
       UPLOAD_BATCH: ${{ inputs.upload_batch }}
+      KEEP_TMP: ${{ inputs.keep_tmp && '1' || '0' }}
 
     steps:
       - name: Skip check
@@ -80,6 +85,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq binutils xz-utils zstd dpkg-dev perl curl ca-certificates
+
+      - name: Disk space (pre)
+        if: steps.skipcheck.outputs.skip == 'false'
+        run: df -h /
 
       # ==========================================================
       # STAGE 1 — CRAWL
@@ -175,42 +184,94 @@ jobs:
           set -euo pipefail
           BASE="${SRC_URL%/}/"
           mkdir -p work/patched work/tmp
+          : > work/failures.log
 
+          # ---------- patcher ----------
           cat > /tmp/patch_one.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
+
           src="$1"; dst="$2"
           tmp="$(mktemp -d)"
-          trap 'rm -rf "$tmp"' EXIT
+          keep="${KEEP_TMP:-0}"
 
-          dpkg-deb -R "$src" "$tmp" 2>/dev/null \
-            || { echo "SKIP -R: $(basename "$src")" >&2; exit 1; }
+          cleanup() {
+            local rc=$?
+            if [ "$rc" -ne 0 ] && [ "$keep" = "1" ]; then
+              echo "KEEP-TMP: $tmp  (rc=$rc)" >&2
+            else
+              rm -rf "$tmp"
+            fi
+          }
+          trap cleanup EXIT
 
-          # On-disk prefix tree
-          [ -d "$tmp/data/data/com.termux" ] && \
+          # 0) refuse to clobber a stale/incomplete output
+          if [ -e "$dst" ]; then
+            if dpkg-deb -I "$dst" >/dev/null 2>&1; then
+              exit 0   # already a valid deb — assume done
+            fi
+            rm -f "$dst"
+          fi
+
+          # 1) extract (capture real error)
+          err=""
+          if ! err="$(dpkg-deb -R "$src" "$tmp" 2>&1)"; then
+            echo "SKIP -R: $(basename "$src"): $err" >&2
+            exit 1
+          fi
+
+          # 2) rename on-disk prefix tree
+          if [ -d "$tmp/data/data/com.termux" ]; then
             mv "$tmp/data/data/com.termux" "$tmp/data/data/app.xodos2"
+          fi
 
-          # Absolute symlink targets
-          find "$tmp" -type l -print0 2>/dev/null | while IFS= read -r -d '' link; do
+          # 3) rewrite absolute symlink targets
+          while IFS= read -r -d '' link; do
             t="$(readlink "$link" 2>/dev/null || true)"
-            case "$t" in *com.termux*) ln -sfn "${t//com.termux/app.xodos2}" "$link" ;; esac
-          done
+            case "$t" in
+              *com.termux*) ln -sfn "${t//com.termux/app.xodos2}" "$link" || true ;;
+            esac
+          done < <(find "$tmp" -type l -print0 2>/dev/null || true)
 
-          # Binary-safe content patch — com.termux == app.xodos2 == 10 bytes
-          find "$tmp" -type f -exec \
-            perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' {} + 2>/dev/null || true
+          # 4) binary-safe content patch (com.termux == app.xodos2 == 10 B)
+          find "$tmp" -type f -print0 2>/dev/null \
+            | xargs -0 -r -n 40 perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' 2>/dev/null \
+            || true
 
-          dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1 \
-            || { echo "SKIP -b: $(basename "$src")" >&2; exit 1; }
+          # 5) pack — capture real error, retry with different compression,
+          #    fall back without --root-owner-group
+          out_err=""
+          if ! out_err="$(dpkg-deb --root-owner-group -b "$tmp" "$dst" 2>&1)"; then
+            echo "PACK-1 FAIL: $(basename "$src"): $out_err" >&2
+            rm -f "$dst"
+
+            # try gzip (some debs use zstd/xz which older dpkg-deb can't re-emit)
+            if ! out_err="$(dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$dst" 2>&1)"; then
+              echo "PACK-2 FAIL: $(basename "$src"): $out_err" >&2
+              rm -f "$dst"
+
+              # last resort: no --root-owner-group
+              if ! out_err="$(dpkg-deb -b "$tmp" "$dst" 2>&1)"; then
+                echo "PACK-3 FAIL: $(basename "$src"): $out_err" >&2
+                rm -f "$dst"
+                exit 1
+              fi
+              echo "PACK-FALLBACK (no --root-owner-group): $(basename "$src")" >&2
+            else
+              echo "PACK-FALLBACK (gzip): $(basename "$src")" >&2
+            fi
+          fi
+
+          exit 0
           EOS
           chmod +x /tmp/patch_one.sh
 
+          # ---------- worker ----------
           cat > /tmp/dl_and_patch.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
-          rel="$1"; BASE="$2"; outdir="$3"; tmpdir="$4"
+          rel="$1"; BASE="$2"; outdir="$3"; tmpdir="$4"; faillog="$5"
 
-          # URL-decode basename (Termux uses %3A for ':' in version)
           enc="$(basename "$rel")"
           fn="$(printf '%s' "$enc" | perl -pe 's/%([0-9A-Fa-f]{2})/chr(hex($1))/ge')"
 
@@ -221,12 +282,13 @@ jobs:
 
           curl -fsSL --retry 4 --retry-delay 2 --max-time 300 \
             -o "$tmpfile" "${BASE}${rel}" 2>/dev/null \
-            || { rm -f "$tmpfile"; echo "DL-FAIL: $rel" >&2; exit 0; }
+            || { rm -f "$tmpfile"; echo "DL-FAIL: $rel" >> "$faillog"; exit 0; }
 
           if /tmp/patch_one.sh "$tmpfile" "$outfile"; then
             rm -f "$tmpfile"
           else
-            rm -f "$tmpfile" "$outfile"
+            rm -f "$tmpfile"
+            echo "PATCH-FAIL: $rel" >> "$faillog"
           fi
           exit 0
           EOS
@@ -234,13 +296,22 @@ jobs:
 
           total=$(wc -l < work/deblist.txt | tr -d ' ')
           echo ">>> download+patch: $total debs, $WORKERS parallel"
+          echo ">>> free space before: $(df -h --output=avail / | tail -1)"
 
           xargs -a work/deblist.txt -P "$WORKERS" -I{} \
-            bash /tmp/dl_and_patch.sh {} "$BASE" "work/patched" "work/tmp" || true
+            bash /tmp/dl_and_patch.sh {} "$BASE" "work/patched" "work/tmp" "work/failures.log" \
+            || true
 
           patched=$(find work/patched -maxdepth 1 -name '*.deb' | wc -l | tr -d ' ')
           echo ">>> patched: $patched / $total"
+          echo ">>> free space after:  $(df -h --output=avail / | tail -1)"
           du -sh work/patched
+
+          if [ -s work/failures.log ]; then
+            nfail=$(wc -l < work/failures.log)
+            echo ">>> $nfail failures:"
+            head -20 work/failures.log
+          fi
 
       # ==========================================================
       # STAGE 3 — CHUNK (≤1000 assets per release, GitHub hard cap)
@@ -279,7 +350,7 @@ jobs:
           done
 
       # ==========================================================
-      # STAGE 4 — RELEASE + UPLOAD  (with batching + configurable delay)
+      # STAGE 4 — RELEASE + UPLOAD (batched + configurable delay)
       # ==========================================================
       - name: Create releases + upload
         if: steps.skipcheck.outputs.skip == 'false'
@@ -322,7 +393,6 @@ jobs:
             echo ">>> uploading $n files to $tag (batch=$BATCH delay=${DELAY}s)"
             i=0; failed=0
 
-            # ---- Batched upload with per-file fallback ----
             while [ "$i" -lt "$n" ]; do
               batch_end=$((i + BATCH))
               [ "$batch_end" -gt "$n" ] && batch_end="$n"
@@ -348,7 +418,6 @@ jobs:
                 i="$batch_end"
                 echo "  [$i/$n] uploaded (batch)"
               else
-                # Fallback: one-by-one for this batch
                 echo "  batch failed, falling back to per-file…"
                 for f in "${batch[@]}"; do
                   ok=0
@@ -364,9 +433,7 @@ jobs:
                     fi
                     sleep "$backoff"
                   done
-                  if [ "$ok" -eq 1 ]; then
-                    :
-                  else
+                  if [ "$ok" -ne 1 ]; then
                     echo "  FAILED: $(basename "$f")"
                     sed -n '1,3p' /tmp/gh_err.log || true
                     failed=$((failed + 1))
@@ -398,4 +465,5 @@ jobs:
             echo "- Patched debs: **${{ steps.chunks.outputs.total }}**"
             echo "- Releases created: **${{ steps.chunks.outputs.chunks }}**"
             echo "- Upload delay: \`${{ inputs.upload_delay }}s\`  ·  batch: \`${{ inputs.upload_batch }}\`"
+            echo "- KEEP_TMP on fail: \`${{ inputs.keep_tmp }}\`"
           } >> "$GITHUB_STEP_SUMMARY"

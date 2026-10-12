@@ -8,13 +8,17 @@ on:
         required: false
         default: "xodos"
       max_debs:
-        description: "Max debs per repo (0 = all)"
+        description: "Max debs per repo (0 = all). Use 30 for a smoke test."
         required: false
         default: "0"
       skip:
         description: "Space-separated repos to skip (main x11 root glibc)"
         required: false
         default: ""
+      workers:
+        description: "Parallel download+patch workers (6 recommended)"
+        required: false
+        default: "6"
 
 permissions:
   contents: write
@@ -46,6 +50,7 @@ jobs:
       TAG_PREFIX: ${{ inputs.tag_prefix }}
       MAX_DEBS: ${{ inputs.max_debs }}
       SKIP_LIST: ${{ inputs.skip }}
+      WORKERS: ${{ inputs.workers }}
 
     steps:
       - name: Skip check
@@ -57,9 +62,8 @@ jobs:
           done
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout
+      - uses: actions/checkout@v4
         if: steps.skipcheck.outputs.skip == 'false'
-        uses: actions/checkout@v4
 
       - name: Install tools
         if: steps.skipcheck.outputs.skip == 'false'
@@ -67,82 +71,80 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq binutils xz-utils zstd dpkg-dev perl curl ca-certificates
 
-      # =================================================================
-      # STAGE 1 — Recursive crawl (L1 = base subdirs; L2 = subdirs of L1).
-      # Every failure is swallowed with `|| true` / `return 0` so a single
-      # 404 never aborts the whole step.
-      # =================================================================
-      - name: Build .deb URL list
+      # ==========================================================
+      # CRAWL  (identical logic to the local script you tested)
+      # ==========================================================
+      - name: Crawl pool for .deb URLs
         if: steps.skipcheck.outputs.skip == 'false'
         run: |
           set -euo pipefail
-          mkdir -p work/orig
-          : > work/deblist.txt
-
+          mkdir -p work
           BASE="${SRC_URL%/}/"
-          export BASE
 
-          echo ">>> Base: $BASE"
-          curl -fsSL --max-time 30 "$BASE" -o work/base.html \
-            || { echo "::error::Cannot fetch $BASE"; exit 1; }
+          cat > /tmp/crawl_one.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          BASE="$1"; sub="${2%/}"; url="${BASE}${sub}/"
+          body="$(curl -fsSL --max-time 30 --retry 3 --retry-delay 1 "$url" 2>/dev/null)" || exit 0
+          [ -z "$body" ] && exit 0
+          printf '%s' "$body" \
+            | sed -E 's/href="([^"]+)"/\n\1\n/g' \
+            | tr -s '[:space:]' '\n' \
+            | grep -E '(.*/|.*\.deb)$' \
+            | grep -vE '^(\.\./|\./|/)$' \
+            | grep -vE '[<>"?]' \
+            | sort -u \
+            | while IFS= read -r e; do printf '%s/%s\n' "$sub" "$e"; done
+          EOS
+          chmod +x /tmp/crawl_one.sh
 
-          # (a) .debs directly under base (flat layout)
-          grep -oE 'href="[^"]+\.deb"' work/base.html 2>/dev/null \
-            | sed -E 's|href="||;s|"$||' >> work/deblist.txt || true
-
-          # (b) L1 = every subdir of base (char folders, libX, or direct
-          #     package dirs — we don't care which, we just walk them).
-          grep -oE 'href="[^"]+/"' work/base.html 2>/dev/null \
-            | sed -E 's|href="||;s|/$||' \
-            | grep -vE '^\.\.?$' \
-            | sort -u > work/L1.txt || true
-
-          echo ">>> L1 subdirs: $(wc -l < work/L1.txt | tr -d ' ')"
-
-          # Emit tagged lines: DEB|<relpath> for .debs, DIR|<relpath> for subdirs.
-          # NOTE: `return 0` at end + no pipefail inside -> xargs never sees 123.
-          crawl_one() {
-            local d="$1"
-            local body
-            body="$(curl -fsSL --max-time 30 "${BASE}${d}/" 2>/dev/null)" || return 0
-            [ -z "$body" ] && return 0
-            printf '%s\n' "$body" \
-              | grep -oE 'href="[^"]+\.deb"' 2>/dev/null \
-              | sed -E 's|href="||;s|"$||' \
-              | while IFS= read -r fn; do printf 'DEB|%s/%s\n' "$d" "$fn"; done
-            printf '%s\n' "$body" \
-              | grep -oE 'href="[^"]+/"' 2>/dev/null \
-              | sed -E 's|href="||;s|/$||' \
-              | grep -vE '^\.\.?$' \
-              | while IFS= read -r sub; do printf 'DIR|%s/%s\n' "$d" "$sub"; done
-            return 0
+          extract_body() {
+            sed -E 's/href="([^"]+)"/\n\1\n/g' \
+              | tr -s '[:space:]' '\n' \
+              | grep -E '(.*/|.*\.deb)$' \
+              | grep -vE '^(\.\./|\./|/)$' \
+              | grep -vE '[<>"?]' \
+              | sort -u
           }
-          export -f crawl_one
 
-          echo ">>> Crawling L1…"
-          # `|| true` so a nonzero xargs exit doesn't abort set -e
-          xargs -a work/L1.txt -P 16 -I{} bash -c 'crawl_one "$@"' _ {} \
-            > work/L1_out.txt 2>/dev/null || true
+          echo ">>> BASE=$BASE"
+          curl -fsSL --max-time 30 "$BASE" > work/base.raw 2>/dev/null \
+            || { echo "::error::cannot fetch $BASE"; exit 1; }
 
-          grep '^DEB|' work/L1_out.txt 2>/dev/null | sed 's|^DEB||' >> work/deblist.txt || true
-          grep '^DIR|' work/L1_out.txt 2>/dev/null | sed 's|^DIR||' | sort -u > work/L2.txt || true
-          echo ">>> L2 subdirs: $(wc -l < work/L2.txt | tr -d ' ')"
+          extract_body < work/base.raw > work/base.entries || true
+          grep -E '\.deb$' work/base.entries | sort -u > work/flat_debs.txt || true
+          grep -E '/$'    work/base.entries | sort -u > work/L1.txt       || true
 
-          echo ">>> Crawling L2…"
-          xargs -a work/L2.txt -P 20 -I{} bash -c 'crawl_one "$@"' _ {} \
-            > work/L2_out.txt 2>/dev/null || true
+          echo ">>> flat debs at base: $(wc -l < work/flat_debs.txt)"
+          echo ">>> L1 dirs:          $(wc -l < work/L1.txt)"
 
-          grep '^DEB|' work/L2_out.txt 2>/dev/null | sed 's|^DEB||' >> work/deblist.txt || true
+          : > work/L1.out
+          if [ -s work/L1.txt ]; then
+            echo ">>> crawling L1 ($(wc -l < work/L1.txt) dirs, parallel 24)…"
+            xargs -a work/L1.txt -P 24 -I{} bash /tmp/crawl_one.sh "$BASE" {} \
+              > work/L1.out 2>/dev/null || true
+          fi
+          grep -E '\.deb$' work/L1.out | sort -u > work/L1_debs.txt || true
+          grep -E '/$'    work/L1.out | sort -u > work/L2.txt       || true
+          echo ">>> L1 debs: $(wc -l < work/L1_debs.txt)  |  L2 dirs: $(wc -l < work/L2.txt)"
 
-          sort -u work/deblist.txt -o work/deblist.txt
+          : > work/L2.out
+          if [ -s work/L2.txt ]; then
+            echo ">>> crawling L2 ($(wc -l < work/L2.txt) dirs, parallel 32)…"
+            xargs -a work/L2.txt -P 32 -I{} bash /tmp/crawl_one.sh "$BASE" {} \
+              > work/L2.out 2>/dev/null || true
+          fi
+          grep -E '\.deb$' work/L2.out | sort -u > work/L2_debs.txt || true
+          echo ">>> L2 debs: $(wc -l < work/L2_debs.txt)"
+
+          cat work/flat_debs.txt work/L1_debs.txt work/L2_debs.txt 2>/dev/null \
+            | sort -u > work/deblist.txt || true
+
           total=$(wc -l < work/deblist.txt | tr -d ' ')
-          echo ">>> Total unique .deb URLs: $total"
-          head -5 work/deblist.txt || true
-
+          echo ">>> TOTAL unique .deb URLs: $total"
           if [ "$total" -eq 0 ]; then
-            echo "::error::Crawler found 0 .deb URLs at $BASE"
-            echo "--- head of base index ---"
-            head -40 work/base.html || true
+            echo "::error::No .deb URLs found at $BASE"
+            head -30 work/base.raw || true
             exit 1
           fi
 
@@ -152,111 +154,88 @@ jobs:
             echo ">>> Limited to first $MAX_DEBS"
           fi
 
-      # =================================================================
-      # STAGE 2 — Parallel download (flat into work/orig/).
-      # =================================================================
-      - name: Download all debs
+          echo ">>> first 5 URLs:"; head -5 work/deblist.txt
+
+      # ==========================================================
+      # DOWNLOAD + PATCH  (interleaved; each worker self-contained)
+      # ==========================================================
+      - name: Download + patch (interleaved)
         if: steps.skipcheck.outputs.skip == 'false'
         run: |
           set -euo pipefail
           BASE="${SRC_URL%/}/"
-          export BASE
+          mkdir -p work/patched work/tmp
 
-          dl_one() {
-            local rel="$1"
-            local base
-            base="$(basename "$rel")"
-            [ -s "work/orig/$base" ] && return 0
-            if curl -fsSL --retry 3 --retry-delay 2 --max-time 300 \
-                    -o "work/orig/$base.tmp" "${BASE}${rel}"; then
-              mv "work/orig/$base.tmp" "work/orig/$base"
-            else
-              rm -f "work/orig/$base.tmp"
-            fi
-            return 0
-          }
-          export -f dl_one
-
-          xargs -a work/deblist.txt -P 12 -I{} bash -c 'dl_one "$@"' _ {} || true
-
-          got=$(find work/orig -maxdepth 1 -name '*.deb' | wc -l | tr -d ' ')
-          echo ">>> Downloaded: $got .deb files"
-          [ "$got" -eq 0 ] && { echo "::error::No debs downloaded"; exit 1; }
-          du -sh work/orig
-
-      # =================================================================
-      # STAGE 3 — Patch every deb in place.
-      #   dpkg-deb -R  ->  mv prefix tree  ->  fix symlinks  ->
-      #   binary-safe perl replace  ->  dpkg-deb -b --root-owner-group
-      #   com.termux == app.xodos2 (both 10 bytes) -> offset-preserving.
-      # =================================================================
-      - name: Patch every deb
-        if: steps.skipcheck.outputs.skip == 'false'
-        run: |
-          set -euo pipefail
-
+          # ---------- patcher ----------
           cat > /tmp/patch_one.sh <<'EOS'
-          #!/bin/bash
+          #!/usr/bin/env bash
           set -euo pipefail
           src="$1"; dst="$2"
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
 
-          dpkg-deb -R "$src" "$tmp" 2>/dev/null || { echo "SKIP -R: $(basename "$src")" >&2; exit 0; }
+          dpkg-deb -R "$src" "$tmp" 2>/dev/null \
+            || { echo "SKIP -R: $(basename "$src")" >&2; exit 1; }
 
-          # 1) rename on-disk prefix tree
+          # on-disk prefix tree
           [ -d "$tmp/data/data/com.termux" ] && mv "$tmp/data/data/com.termux" "$tmp/data/data/app.xodos2"
 
-          # 2) rewrite absolute symlink targets
+          # absolute symlink targets
           find "$tmp" -type l -print0 2>/dev/null | while IFS= read -r -d '' link; do
             t="$(readlink "$link" 2>/dev/null || true)"
             case "$t" in *com.termux*) ln -sfn "${t//com.termux/app.xodos2}" "$link" ;; esac
           done
 
-          # 3) binary-safe content patch (same-length, ELF-safe)
-          find "$tmp" -type f -exec perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' {} + 2>/dev/null || true
+          # binary-safe content patch — com.termux == app.xodos2 == 10 bytes
+          find "$tmp" -type f -exec \
+            perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' {} + 2>/dev/null || true
 
-          # 4) repack as root:root
           dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1 \
-            || { echo "SKIP -b: $(basename "$src")" >&2; exit 0; }
+            || { echo "SKIP -b: $(basename "$src")" >&2; exit 1; }
           EOS
           chmod +x /tmp/patch_one.sh
 
-          mkdir -p work/patched
-          cd work
+          # ---------- worker ----------
+          cat > /tmp/dl_and_patch.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          rel="$1"; BASE="$2"; outdir="$3"; tmpdir="$4"
 
-          mapfile -t files < <(find orig -maxdepth 1 -name '*.deb' -printf '%f\n' | sort)
-          total="${#files[@]}"
-          echo ">>> To patch: $total"
+          # URL-decode basename (Termux uses %3A for ':' in version)
+          enc="$(basename "$rel")"
+          fn="$(printf '%s' "$enc" | perl -pe 's/%([0-9A-Fa-f]{2})/chr(hex($1))/ge')"
 
-          echo 0 > /tmp/patched.count
-          : > /tmp/patched.lock
+          tmpfile="$tmpdir/$fn"
+          outfile="$outdir/$fn"
 
-          patch_and_count() {
-            base="$1"
-            if /tmp/patch_one.sh "orig/$base" "patched/$base"; then
-              rm -f "orig/$base"
-              {
-                flock 9
-                n=$(cat /tmp/patched.count); n=$((n + 1)); echo "$n" > /tmp/patched.count
-                [ $((n % 200)) -eq 0 ] && echo ">>> patched $n/$total" >&2
-              } 9>/tmp/patched.lock
-            fi
-            return 0
-          }
-          export -f patch_and_count
-          export total
+          [ -s "$outfile" ] && exit 0
 
-          printf '%s\n' "${files[@]}" \
-            | xargs -P 4 -I{} bash -c 'patch_and_count "$@"' _ {} || true
+          curl -fsSL --retry 4 --retry-delay 2 --max-time 300 \
+            -o "$tmpfile" "${BASE}${rel}" 2>/dev/null \
+            || { rm -f "$tmpfile"; echo "DL-FAIL: $rel" >&2; exit 0; }
 
-          echo ">>> DONE: patched=$(cat /tmp/patched.count) / total=$total"
-          du -sh patched
+          if /tmp/patch_one.sh "$tmpfile" "$outfile"; then
+            rm -f "$tmpfile"
+          else
+            rm -f "$tmpfile" "$outfile"
+          fi
+          EOS
+          chmod +x /tmp/dl_and_patch.sh
 
-      # =================================================================
-      # STAGE 4 — Chunk ≤1000 assets per release.
-      # =================================================================
-      - name: Split into chunks
+          total=$(wc -l < work/deblist.txt | tr -d ' ')
+          echo ">>> download+patch: $total debs, $WORKERS parallel"
+
+          xargs -a work/deblist.txt -P "$WORKERS" -I{} \
+            bash /tmp/dl_and_patch.sh {} "$BASE" "work/patched" "work/tmp" || true
+
+          patched=$(find work/patched -maxdepth 1 -name '*.deb' | wc -l | tr -d ' ')
+          echo ">>> patched: $patched / $total"
+          du -sh work/patched
+
+      # ==========================================================
+      # CHUNK ≤1000 assets / release  (GitHub hard limit)
+      # ==========================================================
+      - name: Chunk into ≤1000 assets per release
         if: steps.skipcheck.outputs.skip == 'false'
         id: chunks
         run: |
@@ -266,7 +245,7 @@ jobs:
 
           mapfile -t files < <(find patched -maxdepth 1 -name '*.deb' -printf '%f\n' | sort)
           total="${#files[@]}"
-          echo ">>> Patched: $total"
+          echo ">>> patched: $total"
           [ "$total" -eq 0 ] && { echo "::error::Nothing patched"; exit 1; }
 
           chunk_idx=0; i=0
@@ -286,15 +265,14 @@ jobs:
             echo "  $d: $(find "$d" -name '*.deb' | wc -l) files, $(du -sh "$d" | cut -f1)"
           done
 
-      # =================================================================
-      # STAGE 5 — Release + upload.
-      # =================================================================
+      # ==========================================================
+      # RELEASE + UPLOAD  (with exponential backoff)
+      # ==========================================================
       - name: Create releases + upload
         if: steps.skipcheck.outputs.skip == 'false'
         run: |
           set -euo pipefail
           cd work
-
           TS=$(date -u +'%Y.%m.%d-%H%M%S')
           PFX="${TAG_PREFIX:-xodos}"
           nchunks=${{ steps.chunks.outputs.chunks }}
@@ -309,22 +287,24 @@ jobs:
           Patched Termux \`.deb\` packages for **${REPO_NAME}**.
 
           - Source pool: \`${SRC_URL}\`
-          - Patch: \`/data/data/com.termux\` → \`/data/data/app.xodos2\` (tree, symlink
-            targets, file contents — binary-safe, offset-preserving)
+          - Prefix patch: \`/data/data/com.termux\` → \`/data/data/app.xodos2\`
+            (tree, symlink targets, and file contents via binary-safe
+            \`perl -0777\`; both strings are 10 bytes so ELF offsets are preserved)
           - Repacked with \`dpkg-deb --root-owner-group -b\`
           - Part **${part}/${nchunks}** — total patched this run: **${total}**
-          - Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - Run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
           EOF
 
-            echo ">>> Creating release: $tag"
+            echo ">>> creating: $tag"
             gh release create "$tag" --repo "$REPO" \
               --title "$title" --notes-file /tmp/notes.md \
               --target "${{ github.sha }}"
 
             mapfile -t files < <(find "$d" -maxdepth 1 -name '*.deb' -printf '%p\n' | sort)
             n="${#files[@]}"
-            echo ">>> Uploading $n files to $tag"
+            echo ">>> uploading $n files to $tag"
             i=0; failed=0
+
             for f in "${files[@]}"; do
               i=$((i + 1))
               ok=0
@@ -339,6 +319,7 @@ jobs:
                 fi
                 sleep "$backoff"
               done
+
               if [ "$ok" -eq 1 ]; then
                 [ $((i % 50)) -eq 0 ] || [ "$i" -eq "$n" ] && echo "  [$i/$n] uploaded"
               else
@@ -348,6 +329,7 @@ jobs:
               fi
               sleep 0.15
             done
+
             echo ">>> $tag: $((n - failed))/${n} uploaded, failed=$failed"
             [ "$failed" -gt 0 ] && echo "::warning::$failed upload(s) failed for $tag"
           done

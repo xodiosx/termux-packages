@@ -1,0 +1,89 @@
+name: Sync .deb files to Hugging Face
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "GitHub repo with release tags (owner/name)"
+        required: true
+        default: "xodiosx/termux-packages"
+      hf_repo_id:
+        description: "Hugging Face dataset repo (username/repo-name)"
+        required: true
+        default: "your-hf-username/xodos-packages"
+      tags:
+        description: "Space/comma separated tags. Leave empty to auto-discover."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  sync-to-hf:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Resolve tags
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SRC: ${{ inputs.source_repo }}
+        INPUT_TAGS: ${{ inputs.tags }}
+      run: |
+        mkdir -p /tmp/plan
+        : > /tmp/plan/tags.txt
+        if [ -n "$INPUT_TAGS" ]; then
+          read -a TAGS <<< "${INPUT_TAGS//,/ }"
+          printf '%s\n' "${TAGS[@]}" > /tmp/plan/tags.txt
+        else
+          gh release list --repo "$SRC" --limit 1000 \
+            --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | .[].tagName | select(startswith("xodos-XoDos-"))' \
+            > /tmp/plan/tags.txt
+        fi
+        echo ">>> Tags to process:"
+        cat /tmp/plan/tags.txt
+
+    - name: Download .deb files and upload to Hugging Face
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        SRC: ${{ inputs.source_repo }}
+        HF_REPO: ${{ inputs.hf_repo_id }}
+      run: |
+        pip install -q "huggingface_hub>=0.23"
+        
+        # Ensure the HF repo exists
+        python3 -c "
+        from huggingface_hub import HfApi
+        import os
+        api = HfApi()
+        api.create_repo(repo_id=os.environ['HF_REPO'], repo_type='dataset', exist_ok=True)
+        print('>>> Hugging Face repo ready')
+        "
+
+        while IFS= read -r tag; do
+          [ -z "$tag" ] && continue
+          echo ">>> Processing tag: $tag"
+          tmpdir=$(mktemp -d)
+          gh release download "$tag" --repo "$SRC" --pattern "*.deb" --dir "$tmpdir" 2>/dev/null || continue
+          
+          # Upload each .deb file to Hugging Face
+          find "$tmpdir" -maxdepth 1 -type f -name '*.deb' -print0 | while IFS= read -r -d '' deb; do
+            fname=$(basename "$deb")
+            echo "    Uploading $fname to Hugging Face..."
+            python3 -c "
+        from huggingface_hub import HfApi
+        import os, sys
+        api = HfApi()
+        api.upload_file(
+            path_or_fileobj='$deb',
+            path_in_repo='$fname',
+            repo_id=os.environ['HF_REPO'],
+            repo_type='dataset',
+            token=os.environ['HF_TOKEN']
+        )
+        "
+          done
+          rm -rf "$tmpdir"
+        done < /tmp/plan/tags.txt
+
+        echo ">>> All uploads complete"

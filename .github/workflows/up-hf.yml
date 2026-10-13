@@ -3,16 +3,12 @@ name: Sync .deb files to Hugging Face
 on:
   workflow_dispatch:
     inputs:
-      source_repo:
-        description: "GitHub repo with release tags (owner/name)"
-        required: true
-        default: "xodiosx/termux-packages"
       hf_repo_id:
         description: "Hugging Face dataset repo (username/repo-name)"
         required: true
-        default: "your-hf-username/xodos-packages"
+        default: "xodiosx/xodos-packages"
       tags:
-        description: "Space/comma separated tags. Leave empty to auto-discover."
+        description: "Space/comma separated tags. Leave empty to auto-discover xodos-XoDos-* tags."
         required: false
         default: ""
 
@@ -23,67 +19,176 @@ jobs:
   sync-to-hf:
     runs-on: ubuntu-24.04
     steps:
+
     - name: Resolve tags
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        SRC: ${{ inputs.source_repo }}
         INPUT_TAGS: ${{ inputs.tags }}
       run: |
+        set -euo pipefail
         mkdir -p /tmp/plan
         : > /tmp/plan/tags.txt
+
+        echo ">>> Repo: ${{ github.repository }}"
+
         if [ -n "$INPUT_TAGS" ]; then
           read -a TAGS <<< "${INPUT_TAGS//,/ }"
           printf '%s\n' "${TAGS[@]}" > /tmp/plan/tags.txt
         else
-          gh release list --repo "$SRC" --limit 1000 \
+          echo ">>> Auto-discovering tags..."
+          gh release list --repo "${{ github.repository }}" --limit 1000 \
             --json tagName,createdAt \
             --jq 'sort_by(.createdAt) | .[].tagName | select(startswith("xodos-XoDos-"))' \
             > /tmp/plan/tags.txt
         fi
-        echo ">>> Tags to process:"
+
+        if [ ! -s /tmp/plan/tags.txt ]; then
+          echo "::error::No tags resolved."
+          gh release list --repo "${{ github.repository }}" --limit 10 || true
+          exit 1
+        fi
+
+        echo ">>> Tags to process ($(wc -l < /tmp/plan/tags.txt)):"
         cat /tmp/plan/tags.txt
 
-    - name: Download .deb files and upload to Hugging Face
+    - name: Install tools
+      run: |
+        set -euo pipefail
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq unzip
+        pip install -q --upgrade "huggingface_hub[cli]>=0.23"
+
+    - name: Create HF dataset repo (idempotent)
       env:
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        SRC: ${{ inputs.source_repo }}
         HF_REPO: ${{ inputs.hf_repo_id }}
       run: |
-        pip install -q "huggingface_hub>=0.23"
-        
-        # Ensure the HF repo exists
-        python3 -c "
-        from huggingface_hub import HfApi
-        import os
-        api = HfApi()
-        api.create_repo(repo_id=os.environ['HF_REPO'], repo_type='dataset', exist_ok=True)
-        print('>>> Hugging Face repo ready')
-        "
+        set -euo pipefail
+        huggingface-cli repo create "$HF_REPO" --repo-type dataset --exist-ok --token "$HF_TOKEN"
+        echo ">>> Hugging Face repo ready: https://huggingface.co/datasets/$HF_REPO"
+
+    - name: Download from GitHub + upload to Hugging Face
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        SRC: ${{ github.repository }}
+        HF_REPO: ${{ inputs.hf_repo_id }}
+      run: |
+        set -euo pipefail
+
+        WORK=/tmp/hf-work
+        rm -rf "$WORK"
+        mkdir -p "$WORK"
+
+        grand_total=0
+        uploaded_total=0
+        tags_ok=0
+        tags_failed=0
 
         while IFS= read -r tag; do
           [ -z "$tag" ] && continue
-          echo ">>> Processing tag: $tag"
-          tmpdir=$(mktemp -d)
-          gh release download "$tag" --repo "$SRC" --pattern "*.deb" --dir "$tmpdir" 2>/dev/null || continue
-          
-          # Upload each .deb file to Hugging Face
-          find "$tmpdir" -maxdepth 1 -type f -name '*.deb' -print0 | while IFS= read -r -d '' deb; do
-            fname=$(basename "$deb")
-            echo "    Uploading $fname to Hugging Face..."
-            python3 -c "
-        from huggingface_hub import HfApi
-        import os, sys
-        api = HfApi()
-        api.upload_file(
-            path_or_fileobj='$deb',
-            path_in_repo='$fname',
-            repo_id=os.environ['HF_REPO'],
-            repo_type='dataset',
-            token=os.environ['HF_TOKEN']
-        )
-        "
+          echo "=================================================="
+          echo ">>> tag: $tag"
+          echo "=================================================="
+
+          dl="$WORK/dl-$tag"
+          rm -rf "$dl"
+          mkdir -p "$dl"
+
+          # Download every asset (not just *.deb) so we can handle archives.
+          if ! gh release download "$tag" --repo "$SRC" --dir "$dl"; then
+            echo ">>> FAILED to download $tag"
+            tags_failed=$((tags_failed + 1))
+            rm -rf "$dl"
+            continue
+          fi
+
+          echo ">>> downloaded asset list:"
+          find "$dl" -maxdepth 1 -type f -printf '%f\n' | sort | sed 's/^/    /'
+
+          # Extract archives if present, collect any loose .deb files too.
+          extract="$WORK/ex-$tag"
+          rm -rf "$extract"
+          mkdir -p "$extract"
+
+          shopt -s nullglob
+          for arc in "$dl"/*.tar.xz "$dl"/*.tar.gz "$dl"/*.tgz "$dl"/*.zip; do
+            [ -f "$arc" ] || continue
+            echo ">>> extracting $(basename "$arc")"
+            case "$arc" in
+              *.tar.xz)       tar -xJf "$arc" -C "$extract" ;;
+              *.tar.gz|*.tgz) tar -xzf "$arc" -C "$extract" ;;
+              *.zip)          unzip -q "$arc" -d "$extract" ;;
+            esac
           done
-          rm -rf "$tmpdir"
+          shopt -u nullglob
+
+          # Keep any top-level .deb files that weren't inside an archive
+          find "$dl" -maxdepth 1 -type f -name '*.deb' -print0 \
+            | xargs -0r cp -t "$extract/" 2>/dev/null || true
+
+          # Flatten all .deb files into a single directory
+          flat="$WORK/flat-$tag"
+          rm -rf "$flat"
+          mkdir -p "$flat"
+
+          find "$extract" -type f -name '*.deb' -print0 \
+            | xargs -0r cp -t "$flat/" 2>/dev/null || true
+
+          n=$(find "$flat" -maxdepth 1 -type f -name '*.deb' | wc -l)
+          echo ">>> $n .deb file(s) ready to upload"
+          grand_total=$((grand_total + n))
+
+          if [ "$n" -eq 0 ]; then
+            echo ">>> no .deb files in this tag — skipping upload"
+            tags_failed=$((tags_failed + 1))
+            rm -rf "$dl" "$extract" "$flat"
+            continue
+          fi
+
+          # Show a sample
+          echo ">>> sample:"
+          find "$flat" -maxdepth 1 -type f -name '*.deb' -printf '%f\n' | sort | head -5 | sed 's/^/    /'
+
+          # Upload to Hugging Face
+          echo ">>> uploading $n file(s) to $HF_REPO ..."
+          if huggingface-cli upload "$HF_REPO" "$flat" . \
+                --repo-type dataset \
+                --token "$HF_TOKEN"
+          then
+            uploaded_total=$((uploaded_total + n))
+            tags_ok=$((tags_ok + 1))
+            echo ">>> upload OK ($n files)"
+          else
+            echo "::error::upload failed for tag $tag"
+            tags_failed=$((tags_failed + 1))
+          fi
+
+          rm -rf "$dl" "$extract" "$flat"
         done < /tmp/plan/tags.txt
 
-        echo ">>> All uploads complete"
+        echo ""
+        echo "=================================================="
+        echo ">>> tags OK:        $tags_ok"
+        echo ">>> tags failed:    $tags_failed"
+        echo ">>> .deb found:     $grand_total"
+        echo ">>> .deb uploaded:  $uploaded_total"
+        echo "=================================================="
+
+        if [ "$uploaded_total" -eq 0 ]; then
+          echo "::error::Nothing was uploaded."
+          exit 1
+        fi
+
+    - name: Summary
+      run: |
+        {
+          echo "## Hugging Face sync complete"
+          echo ""
+          echo "- Dataset: https://huggingface.co/datasets/${{ inputs.hf_repo_id }}"
+          echo ""
+          echo "Direct file URL:"
+          echo '```'
+          echo "https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/<filename>.deb"
+          echo '```'
+        } >> $GITHUB_STEP_SUMMARY

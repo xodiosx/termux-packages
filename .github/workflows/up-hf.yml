@@ -56,7 +56,9 @@ jobs:
         set -euo pipefail
         sudo apt-get update -qq
         sudo apt-get install -y -qq unzip
-        pip install -q --upgrade "huggingface_hub[cli]>=0.23"
+        pip install -q --upgrade "huggingface_hub[cli]<1.0"
+        echo ">>> installed:"
+        huggingface-cli --help | head -3
 
     - name: Create HF dataset repo (idempotent)
       env:
@@ -95,7 +97,6 @@ jobs:
           rm -rf "$dl"
           mkdir -p "$dl"
 
-          # Download every asset (not just *.deb) so we can handle archives.
           if ! gh release download "$tag" --repo "$SRC" --dir "$dl"; then
             echo ">>> FAILED to download $tag"
             tags_failed=$((tags_failed + 1))
@@ -106,7 +107,6 @@ jobs:
           echo ">>> downloaded asset list:"
           find "$dl" -maxdepth 1 -type f -printf '%f\n' | sort | sed 's/^/    /'
 
-          # Extract archives if present, collect any loose .deb files too.
           extract="$WORK/ex-$tag"
           rm -rf "$extract"
           mkdir -p "$extract"
@@ -123,11 +123,9 @@ jobs:
           done
           shopt -u nullglob
 
-          # Keep any top-level .deb files that weren't inside an archive
           find "$dl" -maxdepth 1 -type f -name '*.deb' -print0 \
             | xargs -0r cp -t "$extract/" 2>/dev/null || true
 
-          # Flatten all .deb files into a single directory
           flat="$WORK/flat-$tag"
           rm -rf "$flat"
           mkdir -p "$flat"
@@ -146,11 +144,9 @@ jobs:
             continue
           fi
 
-          # Show a sample
           echo ">>> sample:"
           find "$flat" -maxdepth 1 -type f -name '*.deb' -printf '%f\n' | sort | head -5 | sed 's/^/    /'
 
-          # Upload to Hugging Face
           echo ">>> uploading $n file(s) to $HF_REPO ..."
           if huggingface-cli upload "$HF_REPO" "$flat" . \
                 --repo-type dataset \

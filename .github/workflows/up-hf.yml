@@ -57,8 +57,8 @@ jobs:
         sudo apt-get update -qq
         sudo apt-get install -y -qq unzip
         pip install -q --upgrade "huggingface_hub[cli]<1.0"
-        echo ">>> installed:"
-        huggingface-cli --help | head -3
+        huggingface-cli --help > /tmp/hf-help.txt 2>&1 || true
+        head -3 /tmp/hf-help.txt || true
 
     - name: Create HF dataset repo (idempotent)
       env:
@@ -104,8 +104,15 @@ jobs:
             continue
           fi
 
+          # Write asset list to file, then head it (avoid SIGPIPE on sort)
+          find "$dl" -maxdepth 1 -type f -printf '%f\n' > /tmp/asset-list.txt
+          sort -o /tmp/asset-list.txt /tmp/asset-list.txt
           echo ">>> downloaded asset list:"
-          find "$dl" -maxdepth 1 -type f -printf '%f\n' | sort | sed 's/^/    /'
+          head -20 /tmp/asset-list.txt | sed 's/^/    /'
+          total_assets=$(wc -l < /tmp/asset-list.txt)
+          if [ "$total_assets" -gt 20 ]; then
+            echo "    ... and $((total_assets - 20)) more"
+          fi
 
           extract="$WORK/ex-$tag"
           rm -rf "$extract"
@@ -144,8 +151,11 @@ jobs:
             continue
           fi
 
+          # Write the sample list to a file first, THEN head it (no SIGPIPE)
+          find "$flat" -maxdepth 1 -type f -name '*.deb' -printf '%f\n' > /tmp/flat-sample.txt
+          sort -o /tmp/flat-sample.txt /tmp/flat-sample.txt
           echo ">>> sample:"
-          find "$flat" -maxdepth 1 -type f -name '*.deb' -printf '%f\n' | sort | head -5 | sed 's/^/    /'
+          head -5 /tmp/flat-sample.txt | sed 's/^/    /'
 
           echo ">>> uploading $n file(s) to $HF_REPO ..."
           if huggingface-cli upload "$HF_REPO" "$flat" . \

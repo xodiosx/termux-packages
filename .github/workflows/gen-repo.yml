@@ -20,7 +20,7 @@ on:
         required: false
         default: "main,x11,root,glibc"
       clean_hf:
-        description: "DELETE EVERYTHING on Hugging Face before uploading (removes old scattered .deb files)"
+        description: "DELETE EVERYTHING on Hugging Face before uploading"
         type: boolean
         default: false
 
@@ -32,17 +32,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
 
+    # ================================================================
+    # PHASE 1 — PREPARATION (no network I/O to GitHub Releases or HF)
+    # ================================================================
+
     - name: Install tools
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y -qq dpkg-dev apt-utils gzip zstd jq
         pip install -q --upgrade "huggingface_hub[cli]<1.0"
-        huggingface-cli --help > /tmp/hf-help.txt 2>&1 || true
-        head -3 /tmp/hf-help.txt || true
 
-    # ==================================================================
-    # 1. Resolve tags
-    # ==================================================================
     - name: Resolve tags
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -81,13 +80,55 @@ jobs:
         done
 
         cut -f1 /tmp/plan/groups.txt | sort -u > /tmp/plan/repos.txt
-        echo ">>> Tags per repo:"
+        echo ">>> Tags to process:"
         sort /tmp/plan/groups.txt | sed 's/^/    /'
 
-    # ==================================================================
-    # 2. Download every .deb from GitHub Releases
-    # ==================================================================
-    - name: Download .deb files from GitHub Releases
+    - name: Validate plan
+      run: |
+        set -euo pipefail
+        echo ">>> plan validation"
+        [ -s /tmp/plan/repos.txt ] || { echo "::error::no repos resolved"; exit 1; }
+        [ -s /tmp/plan/groups.txt ] || { echo "::error::no tags grouped"; exit 1; }
+        echo ">>> repos:"
+        sed 's/^/    /' /tmp/plan/repos.txt
+        echo ">>> tag count per repo:"
+        for r in $(cat /tmp/plan/repos.txt); do
+          n=$(grep -Pc "^${r}\t" /tmp/plan/groups.txt || true)
+          echo "    $r: $n tag(s)"
+        done
+
+    - name: Create HF dataset repo (idempotent)
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        HF_REPO: ${{ inputs.hf_repo_id }}
+      run: |
+        set -euo pipefail
+        huggingface-cli repo create "$HF_REPO" --repo-type dataset --exist-ok --token "$HF_TOKEN"
+        echo ">>> HF repo ready: https://huggingface.co/datasets/$HF_REPO"
+
+    - name: Optionally clean Hugging Face (if clean_hf=true)
+      if: ${{ inputs.clean_hf == 'true' }}
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        HF_REPO: ${{ inputs.hf_repo_id }}
+      run: |
+        set -euo pipefail
+        echo "=================================================="
+        echo ">>> clean_hf=true — DELETING EVERYTHING on HF first"
+        echo "=================================================="
+        EMPTY=$(mktemp -d)
+        huggingface-cli upload "$HF_REPO" "$EMPTY" . \
+          --repo-type dataset \
+          --token "$HF_TOKEN" \
+          --delete "*" || true
+        rm -rf "$EMPTY"
+        echo ">>> HF repo wiped"
+
+    # ================================================================
+    # PHASE 2 — DOWNLOAD (heavy I/O #1, runs near the end)
+    # ================================================================
+
+    - name: "PHASE 2: Download .deb files from GitHub Releases"
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         SRC: ${{ inputs.source_repo }}
@@ -122,9 +163,6 @@ jobs:
           echo "    repo $repo total: $total"
         done < /tmp/plan/repos.txt
 
-    # ==================================================================
-    # 3. Build the full APT repo (dists + pool) for each sub-repo
-    # ==================================================================
     - name: Build full APT repository
       run: |
         set -euo pipefail
@@ -143,15 +181,11 @@ jobs:
             *)     continue ;;
           esac
 
-          echo "=================================================="
           echo ">>> building: xodos-${repo}  (dist=$dist comp=$comp)"
-          echo "=================================================="
-
           outdir="$BUILD/xodos-${repo}"
           pooldir="$outdir/pool/${comp}"
           mkdir -p "$pooldir"
 
-          # Dedup by package name, keep highest version
           tsv="/tmp/all-${repo}.tsv"
           : > "$tsv"
           shopt -s nullglob
@@ -169,15 +203,14 @@ jobs:
           placed=0
           while IFS=$'\t' read -r pkg ver path; do
             [ -z "$pkg" ] && continue
-            first_letter=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
-            dest_dir="${pooldir}/${first_letter}/${pkg}"
+            fl=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
+            dest_dir="${pooldir}/${fl}/${pkg}"
             mkdir -p "$dest_dir"
             cp -a "$path" "$dest_dir/"
             placed=$((placed + 1))
           done < "$winners"
-          echo ">>> placed ${placed} unique packages in pool"
+          echo "    placed ${placed} unique packages"
 
-          # Generate Packages for aarch64 (includes arch:all)
           dists="$outdir/dists/${dist}/${comp}"
           mkdir -p "$dists/binary-aarch64" "$dists/binary-all"
 
@@ -188,15 +221,13 @@ jobs:
             > "dists/${dist}/${comp}/binary-all/Packages"
           cd - >/dev/null
 
-          # Compress (gzip only — GH Pages / HF both handle .gz fine)
           gzip -kf -9 "$dists/binary-aarch64/Packages"
           gzip -kf -9 "$dists/binary-all/Packages"
           rm -f "$dists/binary-aarch64/Packages.xz" "$dists/binary-all/Packages.xz"
 
-          echo "    binary-aarch64: $(grep -c '^Package:' "$dists/binary-aarch64/Packages" || true) entries"
-          echo "    binary-all:     $(grep -c '^Package:' "$dists/binary-all/Packages" || true) entries"
+          echo "    binary-aarch64: $(grep -c '^Package:' "$dists/binary-aarch64/Packages" || true)"
+          echo "    binary-all:     $(grep -c '^Package:' "$dists/binary-all/Packages" || true)"
 
-          # Release file
           conf="/tmp/release-${repo}.conf"
           {
             echo 'APT::FTPArchive::Release::Origin "xodos";'
@@ -212,30 +243,11 @@ jobs:
           apt-ftparchive -c "$conf" release "dists/${dist}" > "dists/${dist}/Release"
           cp "dists/${dist}/Release" "dists/${dist}/InRelease"
           cd - >/dev/null
-          echo ">>> Release written: ${outdir}/dists/${dist}/Release"
         done < /tmp/plan/repos.txt
 
         echo ""
-        echo ">>> final build tree:"
-        find "$BUILD" -maxdepth 3 -type d | sort | sed 's/^/    /'
-        echo ""
-        echo ">>> total size: $(du -sh "$BUILD" | awk '{print $1}')"
+        echo ">>> total build size: $(du -sh "$BUILD" | awk '{print $1}')"
 
-    # ==================================================================
-    # 4. Create HF repo if needed
-    # ==================================================================
-    - name: Create HF dataset repo (idempotent)
-      env:
-        HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        HF_REPO: ${{ inputs.hf_repo_id }}
-      run: |
-        set -euo pipefail
-        huggingface-cli repo create "$HF_REPO" --repo-type dataset --exist-ok --token "$HF_TOKEN"
-        echo ">>> HF repo ready: https://huggingface.co/datasets/$HF_REPO"
-
-    # ==================================================================
-    # 5. Prepare staging dir (with README)
-    # ==================================================================
     - name: Stage for upload
       run: |
         set -euo pipefail
@@ -249,7 +261,7 @@ jobs:
           echo ''
           echo 'APT repository for xodos Termux packages.'
           echo ''
-          echo '## sources.list entries'
+          echo '## sources.list'
           echo ''
           echo '```'
           echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-main stable main"
@@ -259,56 +271,34 @@ jobs:
           echo '```'
         } > "$STAGE/README.md"
 
-        echo ">>> staging tree:"
-        find "$STAGE" -maxdepth 2 -type d | sort | sed 's/^/    /'
-        echo ""
         echo ">>> staging size: $(du -sh "$STAGE" | awk '{print $1}')"
 
-    # ==================================================================
-    # 6. Upload to Hugging Face
-    #    clean_hf=true  → --delete "*" wipes HF repo first
-    #    clean_hf=false → merges (leaves old files in place)
-    # ==================================================================
-    - name: Upload to Hugging Face
+    # ================================================================
+    # PHASE 3 — UPLOAD (heavy I/O #2, THE final step)
+    # ================================================================
+
+    - name: "PHASE 3: Upload everything to Hugging Face"
       env:
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
         HF_REPO: ${{ inputs.hf_repo_id }}
-        CLEAN_HF: ${{ inputs.clean_hf }}
       run: |
         set -euo pipefail
         STAGE=/tmp/hf-stage
+        echo "=================================================="
+        echo ">>> uploading $(du -sh "$STAGE" | awk '{print $1}') to $HF_REPO"
+        echo "=================================================="
 
-        if [ "$CLEAN_HF" = "true" ]; then
-          echo "=================================================="
-          echo ">>> clean_hf=true — DELETING EVERYTHING on HF first"
-          echo "=================================================="
-
-          # huggingface-cli upload supports --delete <pattern>
-          # Using --delete "*" then uploading the new tree means:
-          # 1. Delete all existing files on HF
-          # 2. Upload the new tree
-          # Doing it in one command with an empty local dir isn't
-          # reliable across CLI versions, so we do it in two steps.
-
-          # Step 1: upload an empty directory with --delete "*"
-          EMPTY=$(mktemp -d)
-          echo ">>> wiping remote files..."
-          huggingface-cli upload "$HF_REPO" "$EMPTY" . \
-            --repo-type dataset \
-            --token "$HF_TOKEN" \
-            --delete "*" || true
-          rm -rf "$EMPTY"
-          echo ">>> remote wiped"
-        fi
-
-        echo ">>> uploading new tree to $HF_REPO ..."
         huggingface-cli upload "$HF_REPO" "$STAGE" . \
           --repo-type dataset \
           --token "$HF_TOKEN"
 
         echo ">>> upload complete"
 
-    - name: Verify
+    # ================================================================
+    # PHASE 4 — VERIFY + SUMMARY
+    # ================================================================
+
+    - name: Verify live URLs
       run: |
         echo ">>> checking a few files are live..."
         for f in \
@@ -325,10 +315,10 @@ jobs:
     - name: Summary
       run: |
         {
-          echo "## APT Repository on Hugging Face"
+          echo "## APT Repository published to Hugging Face"
           echo ""
-          echo "- Source tags: \`${{ inputs.source_repo }}\`"
-          echo "- HF repo: https://huggingface.co/datasets/${{ inputs.hf_repo_id }}"
+          echo "- Source: \`${{ inputs.source_repo }}\`"
+          echo "- HF: https://huggingface.co/datasets/${{ inputs.hf_repo_id }}"
           echo "- clean_hf: \`${{ inputs.clean_hf }}\`"
           echo ""
           echo "### sources.list"

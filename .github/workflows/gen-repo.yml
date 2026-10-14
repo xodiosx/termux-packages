@@ -31,9 +31,8 @@ jobs:
       HF_REPO: ${{ inputs.hf_repo_id }}
       SRC: ${{ github.repository }}
       CLEAN_HF: ${{ inputs.clean_hf }}
-      # Use a PAT for GitHub reads — installation token hits 1000/hr limit.
-      # Fall back to GITHUB_TOKEN if PAT is not set.
-      GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN || secrets.GITHUB_TOKEN }}
+      # Use the existing PAT — this is the only line that changed.
+      GH_TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
     steps:
 
     - name: Install tools
@@ -43,13 +42,15 @@ jobs:
         pip install -q --upgrade "huggingface_hub<1.0"
         python3 -c 'import huggingface_hub; print("huggingface_hub", huggingface_hub.__version__)'
 
-    - name: Check token type
+    - name: Check GitHub API rate limit
       run: |
         set -euo pipefail
-        token_type=$(gh api rate_limit --jq '.resources.core.limit' 2>/dev/null || echo "unknown")
-        echo ">>> GitHub API rate limit: $token_type requests/hour"
-        if [ "$token_type" = "1000" ]; then
-          echo "::warning::Using GITHUB_TOKEN (1000/hr). Set SOURCE_REPO_TOKEN (PAT) for 5000/hr."
+        limit=$(gh api rate_limit --jq '.resources.core.limit' 2>/dev/null || echo "unknown")
+        remaining=$(gh api rate_limit --jq '.resources.core.remaining' 2>/dev/null || echo "unknown")
+        echo ">>> GitHub API limit: $limit requests/hour"
+        echo ">>> Remaining:       $remaining"
+        if [ "$limit" = "1000" ]; then
+          echo "::warning::Using an installation token (1000/hr). Set GH_PUSH_TOKEN to a PAT for 5000/hr."
         fi
 
     # ==================================================================
@@ -122,8 +123,7 @@ jobs:
         "
 
     # ==================================================================
-    # 3. Download with retry + backoff + per-file delay
-    #    This is the fix for "API rate limit exceeded for installation"
+    # 3. Download with retry + backoff
     # ==================================================================
     - name: Download from GitHub Releases
       run: |
@@ -131,8 +131,6 @@ jobs:
         rm -rf /tmp/raw-debs
         mkdir -p /tmp/raw-debs
 
-        # Retry helper: tries up to 5 times with exponential backoff
-        # on 403 rate-limit errors, then gives up.
         download_with_retry() {
           local tag="$1" dest="$2"
           local attempt=1
@@ -190,7 +188,6 @@ jobs:
                 | xargs -0r mv -t "/tmp/raw-debs/$repo/"
             fi
 
-            # Extract archives if any
             shopt -s nullglob
             for arc in "$tmpdir"/*.tar.xz "$tmpdir"/*.tar.gz "$tmpdir"/*.tgz "$tmpdir"/*.zip; do
               [ -f "$arc" ] || continue
@@ -212,8 +209,6 @@ jobs:
             shopt -u nullglob
 
             rm -rf "$tmpdir"
-
-            # Small delay between tags to avoid secondary rate limit
             sleep 3
           done < <(grep -P "^${repo}\t" /tmp/plan/groups.txt | cut -f2)
 
@@ -232,7 +227,7 @@ jobs:
         fi
 
     # ==================================================================
-    # 4. Build full APT tree (same as before)
+    # 4. Build full APT tree
     # ==================================================================
     - name: Build APT repository tree
       run: |

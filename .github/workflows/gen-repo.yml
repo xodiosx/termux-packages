@@ -47,65 +47,67 @@ jobs:
       MODE: ${{ inputs.mode }}
       REPOS_IN: ${{ inputs.repos }}
       CLEAN_HF: ${{ inputs.clean_hf }}
-      # XET stays enabled — no HF_HUB_DISABLE_XET
       HF_HUB_DISABLE_TELEMETRY: "1"
+      # Force absolute path so `cd` never breaks relative lookups
+      WORK_DIR: ${{ github.workspace }}/work
 
     steps:
       - name: Install tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq dpkg-dev apt-utils gzip jq
-          # Pin to >=1.29.0 — fixes the XET rate limit bug
           pip install -q --upgrade "huggingface_hub>=1.29.0"
           python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)"
-          python3 -c "import hf_xet; print('hf_xet OK')" 2>/dev/null || echo ">>> hf_xet not installed (XET will fall back to HTTP)"
 
       - name: Compute targets
         run: |
           set -euo pipefail
-          mkdir -p work
-          : > work/targets.txt
-          : > work/dist-comp.txt
+          mkdir -p "$WORK_DIR"
+          : > "$WORK_DIR/targets.txt"
+          : > "$WORK_DIR/dist-comp.txt"
           for r in $(echo "$REPOS_IN" | tr ',' ' '); do
             r=$(echo "$r" | tr -d ' ')
             [ -z "$r" ] && continue
             case "$r" in
               main)
-                echo "xodos-main" >> work/targets.txt
-                echo "xodos-main stable main" >> work/dist-comp.txt
+                echo "xodos-main" >> "$WORK_DIR/targets.txt"
+                echo "xodos-main stable main" >> "$WORK_DIR/dist-comp.txt"
                 ;;
               x11)
-                echo "xodos-x11" >> work/targets.txt
-                echo "xodos-x11 x11 main" >> work/dist-comp.txt
+                echo "xodos-x11" >> "$WORK_DIR/targets.txt"
+                echo "xodos-x11 x11 main" >> "$WORK_DIR/dist-comp.txt"
                 ;;
               root)
-                echo "xodos-root" >> work/targets.txt
-                echo "xodos-root root stable" >> work/dist-comp.txt
+                echo "xodos-root" >> "$WORK_DIR/targets.txt"
+                echo "xodos-root root stable" >> "$WORK_DIR/dist-comp.txt"
                 ;;
               glibc)
-                echo "xodos-glibc" >> work/targets.txt
-                echo "xodos-glibc glibc main" >> work/dist-comp.txt
+                echo "xodos-glibc" >> "$WORK_DIR/targets.txt"
+                echo "xodos-glibc glibc main" >> "$WORK_DIR/dist-comp.txt"
                 ;;
               tur)
-                echo "xodos-tur" >> work/targets.txt
-                echo "xodos-tur tur-packages tur" >> work/dist-comp.txt
+                echo "xodos-tur" >> "$WORK_DIR/targets.txt"
+                echo "xodos-tur tur-packages tur" >> "$WORK_DIR/dist-comp.txt"
                 ;;
               tur-on-device)
-                echo "xodos-tur" >> work/targets.txt
-                echo "xodos-tur tur-packages tur-on-device" >> work/dist-comp.txt
+                echo "xodos-tur" >> "$WORK_DIR/targets.txt"
+                echo "xodos-tur tur-packages tur-on-device" >> "$WORK_DIR/dist-comp.txt"
                 ;;
               tur-continuous)
-                echo "xodos-tur" >> work/targets.txt
-                echo "xodos-tur tur-packages tur-continuous" >> work/dist-comp.txt
+                echo "xodos-tur" >> "$WORK_DIR/targets.txt"
+                echo "xodos-tur tur-packages tur-continuous" >> "$WORK_DIR/dist-comp.txt"
                 ;;
               *) echo "::error::Unknown repo: $r"; exit 1 ;;
             esac
           done
-          sort -u work/targets.txt -o work/targets.txt
-          sort -u work/dist-comp.txt -o work/dist-comp.txt
+          sort -u "$WORK_DIR/targets.txt" -o "$WORK_DIR/targets.txt"
+          sort -u "$WORK_DIR/dist-comp.txt" -o "$WORK_DIR/dist-comp.txt"
           echo ">>> Mode: $MODE"
+          echo ">>> WORK_DIR: $WORK_DIR"
           echo ">>> Targets:"
-          sed 's/^/    /' work/targets.txt
+          sed 's/^/    /' "$WORK_DIR/targets.txt"
+          echo ">>> Dist/comp pairs:"
+          sed 's/^/    /' "$WORK_DIR/dist-comp.txt"
 
       - name: Wipe Hugging Face repo
         if: ${{ inputs.mode == 'full' && inputs.clean_hf }}
@@ -129,19 +131,17 @@ jobs:
           PYEOF
           python3 /tmp/wipe.py
 
-      - name: Download .deb from Hugging Face (XET enabled)
+      - name: Download .deb from Hugging Face
         if: ${{ inputs.mode == 'metadata-only' }}
         run: |
           set -euo pipefail
           cat > /tmp/dl_hf.py << 'PYEOF'
-          import os, time, sys
+          import os, time
           from huggingface_hub import snapshot_download
-
-          targets = [l.strip() for l in open("work/targets.txt") if l.strip()]
+          targets_file = os.environ["WORK_DIR"] + "/targets.txt"
+          targets = [l.strip() for l in open(targets_file) if l.strip()]
           patterns = [t + "/pool/**" for t in targets]
           print(">>> patterns:", patterns)
-          print(">>> HF_HUB_DISABLE_XET =", os.environ.get("HF_HUB_DISABLE_XET", "(unset — XET enabled)"))
-
           last_err = None
           for attempt in range(1, 6):
               try:
@@ -208,9 +208,9 @@ jobs:
               --json tagName,createdAt \
               --jq 'sort_by(.createdAt) | .[].tagName | select(startswith("xodos-XoDos-"))'
           )
-          : > work/tags-for-run.txt
+          : > "$WORK_DIR/tags-for-run.txt"
           for tag in "${TAGS[@]}"; do
-            for target in $(cat work/targets.txt); do
+            for target in $(cat "$WORK_DIR/targets.txt"); do
               short="${target#xodos-}"
               case "$short" in
                 main)  pattern='^xodos-XoDos-main-p[0-9]+-' ;;
@@ -220,17 +220,17 @@ jobs:
                 tur)   pattern='^xodos-XoDos-tur-(continuous|on-device)-p[0-9]+-|^xodos-XoDos-tur-p[0-9]+-' ;;
               esac
               if echo "$tag" | grep -qE "$pattern"; then
-                echo "$target|$tag" >> work/tags-for-run.txt
+                echo "$target|$tag" >> "$WORK_DIR/tags-for-run.txt"
                 break
               fi
             done
           done
-          if [ ! -s work/tags-for-run.txt ]; then
+          if [ ! -s "$WORK_DIR/tags-for-run.txt" ]; then
             echo "::error::No matching tags for selected repos"
             exit 1
           fi
           echo ">>> tags to download:"
-          sed 's/^/    /' work/tags-for-run.txt
+          sed 's/^/    /' "$WORK_DIR/tags-for-run.txt"
           while IFS='|' read -r target tag; do
             [ -z "$tag" ] && continue
             echo ">>> $target / $tag"
@@ -248,7 +248,7 @@ jobs:
               | xargs -0r mv -t "/tmp/gh-debs/${target}/"
             rm -rf "$tmpdir"
             sleep 2
-          done < work/tags-for-run.txt
+          done < "$WORK_DIR/tags-for-run.txt"
           if [ -n "$failed" ]; then
             echo "::error::Failed tags:$failed"
             exit 1
@@ -290,9 +290,12 @@ jobs:
               cp -a "$deb" "$dest/" 2>/dev/null || true
             done
             shopt -u nullglob
-          done < work/tags-for-run.txt
+          done < "$WORK_DIR/tags-for-run.txt"
           echo ">>> .deb staged: $(find "$POOL" -type f -name '*.deb' | wc -l)"
 
+      # ==================================================================
+      # Build dists — every path is absolute now.
+      # ==================================================================
       - name: Build dists metadata
         run: |
           set -euo pipefail
@@ -306,6 +309,7 @@ jobs:
           fi
           echo ">>> SRC_ROOT=$SRC_ROOT"
 
+          # --- Packages (per component) ---
           while read -r target dist comp; do
             [ -z "$target" ] && continue
             pooldir="$SRC_ROOT/${target}/pool/${comp}"
@@ -355,10 +359,12 @@ jobs:
             echo "    placed: $placed"
             gzip -kf -9 "$outd/Packages"
             rm -f "$outd/Packages.xz" "$tsv" "${tsv}.w"
-          done < work/dist-comp.txt
+          done < "$WORK_DIR/dist-comp.txt"
 
+          # --- Release files: use ABSOLUTE path to targets.txt ---
           cd "$BUILD"
-          for target in $(cat work/targets.txt); do
+          while read -r target; do
+            [ -z "$target" ] && continue
             [ -d "$target/dists" ] || continue
             for dist_dir in "$target"/dists/*/; do
               [ -d "$dist_dir" ] || continue
@@ -385,7 +391,27 @@ jobs:
                 > "$target/dists/$dist/Release"
               cp "$target/dists/$dist/Release" "$target/dists/$dist/InRelease"
             done
-          done
+          done < "$WORK_DIR/targets.txt"
+
+          # --- Sanity: every target MUST have Release + InRelease ---
+          fail=0
+          while read -r target; do
+            [ -z "$target" ] && continue
+            [ -d "$target/dists" ] || { echo "::error::$target has no dists/"; fail=$((fail+1)); continue; }
+            found_rel=$(find "$target/dists" -type f -name Release | wc -l)
+            found_inrel=$(find "$target/dists" -type f -name InRelease | wc -l)
+            echo ">>> $target: Release=$found_rel  InRelease=$found_inrel"
+            [ "$found_rel" -ge 1 ] || fail=$((fail+1))
+            [ "$found_inrel" -ge 1 ] || fail=$((fail+1))
+          done < "$WORK_DIR/targets.txt"
+          if [ "$fail" -gt 0 ]; then
+            echo "::error::Missing Release/InRelease for $fail target(s) — refusing to upload incomplete metadata"
+            find "$BUILD" -type f | sort | sed 's/^/    /'
+            exit 1
+          fi
+
+          echo ">>> dists tree:"
+          find "$BUILD" -type f | sort | sed 's/^/    /'
           echo ">>> dists size: $(du -sh "$BUILD" | awk '{print $1}')"
 
       - name: Upload to Hugging Face
@@ -398,9 +424,10 @@ jobs:
           repo = os.environ["HF_REPO"]
           token = os.environ["HF_TOKEN"]
           mode = os.environ["MODE"]
+          work = os.environ["WORK_DIR"]
           api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True, token=token)
           print(">>> HF repo:", repo, "| mode:", mode)
-          targets = [l.strip() for l in open("work/targets.txt") if l.strip()]
+          targets = [l.strip() for l in open(work + "/targets.txt") if l.strip()]
 
           def with_retry(fn, label):
               for attempt in range(1, 6):
@@ -477,6 +504,9 @@ jobs:
           PYEOF
           python3 /tmp/upload.py
 
+      # ==================================================================
+      # Verify — follow redirects (HF uses 302 for resolve/main/*)
+      # ==================================================================
       - name: Verify URLs
         run: |
           set -euo pipefail
@@ -486,12 +516,16 @@ jobs:
             [ -z "$target" ] && continue
             for f in "Release" "InRelease" "${comp}/binary-aarch64/Packages.gz"; do
               url="${base}/${target}/dists/${dist}/${f}?t=$(date +%s)"
-              code=$(curl -s -o /dev/null -w "%{http_code}" "$url")
+              # -L follows the 302 to the CDN
+              code=$(curl -sL -o /dev/null -w "%{http_code}" "$url")
               printf '  %s  %s\n' "$code" "${target}/dists/${dist}/${f}"
               [ "$code" = "200" ] || fail=$((fail+1))
             done
-          done < work/dist-comp.txt
-          [ "$fail" -gt 0 ] && { echo "::error::$fail URLs unreachable"; exit 1; }
+          done < "$WORK_DIR/dist-comp.txt"
+          if [ "$fail" -gt 0 ]; then
+            echo "::error::$fail URLs unreachable"
+            exit 1
+          fi
           echo ">>> all URLs OK"
 
       - name: Summary
@@ -503,5 +537,4 @@ jobs:
             echo "**Repos:** \`${{ inputs.repos }}\`"
             echo "**clean_hf:** \`${{ inputs.clean_hf }}\`"
             echo "**huggingface_hub:** $(python3 -c 'import huggingface_hub; print(huggingface_hub.__version__)')"
-            echo "**XET:** enabled"
           } >> $GITHUB_STEP_SUMMARY

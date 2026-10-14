@@ -133,6 +133,9 @@ jobs:
           PYEOF
           python3 /tmp/wipe.py
 
+      # ==================================================================
+      # DOWNLOAD from Hugging Face (metadata-only mode)
+      # ==================================================================
       - name: Download .deb from Hugging Face (validated)
         if: ${{ inputs.mode == 'metadata-only' }}
         run: |
@@ -211,29 +214,28 @@ jobs:
           n=$(find /tmp/hf-debs -type f -name '*.deb' | wc -l)
           echo ">>> valid .deb on disk: $n"
 
+      # ==================================================================
+      # DOWNLOAD from GitHub Releases
+      # - 1 API call per tag (gh release view --json assets)
+      # - CDN URLs for downloads — no rate limit, shows progress
+      # ==================================================================
       - name: Download .deb from GitHub Releases
         if: ${{ inputs.mode != 'metadata-only' }}
         run: |
           set -euo pipefail
-          rm -rf /tmp/gh-debs; mkdir -p /tmp/gh-debs
-          download_tag() {
-            local tag="$1" dest="$2" attempt=1
-            while [ "$attempt" -le 6 ]; do
-              if gh release download "$tag" --repo "$SRC_REPO" \
-                   --pattern "*.deb" --dir "$dest" 2>/tmp/gh_err.log; then return 0; fi
-              if grep -qiE 'rate limit|403|429|secondary' /tmp/gh_err.log; then sleep $((attempt*60))
-              else sleep $((attempt*10)); fi
-              attempt=$((attempt+1))
-            done
-            return 1
-          }
-          failed=""
+          rm -rf /tmp/gh-debs
+          mkdir -p /tmp/gh-debs
+          : > "$WORK_DIR/tags-for-run.txt"
+
+          # 1. Find matching tags (1 API call for the whole list)
+          echo ">>> listing tags from $SRC_REPO ..."
           mapfile -t TAGS < <(
             gh release list --repo "$SRC_REPO" --limit 1000 \
               --json tagName,createdAt \
               --jq 'sort_by(.createdAt) | .[].tagName | select(startswith("xodos-XoDos-"))'
           )
-          : > "$WORK_DIR/tags-for-run.txt"
+          echo ">>> total releases: ${#TAGS[@]}"
+
           for tag in "${TAGS[@]}"; do
             for target in $(cat "$WORK_DIR/targets.txt"); do
               short="${target#xodos-}"
@@ -245,21 +247,99 @@ jobs:
                 tur)   pattern='^xodos-XoDos-tur-(continuous|on-device)-p[0-9]+-|^xodos-XoDos-tur-p[0-9]+-' ;;
               esac
               if echo "$tag" | grep -qE "$pattern"; then
-                echo "$target|$tag" >> "$WORK_DIR/tags-for-run.txt"; break
+                echo "$target|$tag" >> "$WORK_DIR/tags-for-run.txt"
+                break
               fi
             done
           done
+          if [ ! -s "$WORK_DIR/tags-for-run.txt" ]; then
+            echo "::error::No matching tags for selected repos"
+            exit 1
+          fi
+          echo ">>> tags to download:"
+          sed 's/^/    /' "$WORK_DIR/tags-for-run.txt"
+
+          # 2. Per-tag: list assets (1 API call) then curl each (CDN, no API)
+          download_tag() {
+            local tag="$1" target="$2"
+            local dest="/tmp/gh-debs/$target"
+            mkdir -p "$dest"
+
+            # List assets for this tag — 1 API call
+            local assets_file="/tmp/assets-${tag}.txt"
+            if ! gh release view "$tag" --repo "$SRC_REPO" \
+                 --json assets --jq '.assets[].name' > "$assets_file" 2>/tmp/gh_err.log; then
+              echo "        FAIL to list assets: $(head -1 /tmp/gh_err.log)"
+              return 1
+            fi
+            local total
+            total=$(wc -l < "$assets_file")
+            echo "        $total assets in release"
+
+            if [ "$total" -eq 0 ]; then
+              echo "        no assets"; return 1
+            fi
+
+            # Download each asset from the public CDN URL
+            local ok=0 fail=0 count=0
+            while IFS= read -r fname; do
+              [ -z "$fname" ] && continue
+              case "$fname" in *.deb) ;; *) continue ;; esac
+              count=$((count + 1))
+              local url="https://github.com/${SRC_REPO}/releases/download/${tag}/${fname}"
+              local out="$dest/$fname"
+              if [ -s "$out" ]; then
+                ok=$((ok + 1))
+                continue
+              fi
+              local attempt=1 curl_ok=0
+              while [ "$attempt" -le 5 ]; do
+                if curl -fsSL --retry 0 --connect-timeout 30 --max-time 600 \
+                     -o "$out" "$url" 2>/tmp/curl_err.log; then
+                  curl_ok=1
+                  break
+                fi
+                rm -f "$out"
+                sleep $((attempt * 3))
+                attempt=$((attempt + 1))
+              done
+              if [ "$curl_ok" = "1" ]; then
+                ok=$((ok + 1))
+              else
+                fail=$((fail + 1))
+                echo "        FAIL: $fname"
+              fi
+              if [ $((count % 200)) -eq 0 ]; then
+                echo "        [$count/$total]  ok=$ok fail=$fail"
+              fi
+            done < "$assets_file"
+            echo "        done: downloaded=$ok failed=$fail"
+            return 0
+          }
+
+          failed=""
+          tag_num=0
+          total_tags=$(wc -l < "$WORK_DIR/tags-for-run.txt")
           while IFS='|' read -r target tag; do
             [ -z "$tag" ] && continue
-            tmpdir=$(mktemp -d)
-            if ! download_tag "$tag" "$tmpdir"; then
-              failed="$failed $tag"; rm -rf "$tmpdir"; continue
+            tag_num=$((tag_num + 1))
+            echo "=================================================="
+            echo ">>> [$tag_num/$total_tags] $target / $tag"
+            echo "=================================================="
+            if ! download_tag "$tag" "$target"; then
+              failed="$failed $tag"
             fi
-            mkdir -p "/tmp/gh-debs/${target}"
-            find "$tmpdir" -maxdepth 1 -name '*.deb' -print0 | xargs -0r mv -t "/tmp/gh-debs/${target}/"
-            rm -rf "$tmpdir"; sleep 2
           done < "$WORK_DIR/tags-for-run.txt"
-          if [ -n "$failed" ]; then echo "::error::Failed:$failed"; exit 1; fi
+
+          if [ -n "$failed" ]; then
+            echo "::error::Tags that failed:$failed"
+            exit 1
+          fi
+
+          total=$(find /tmp/gh-debs -type f -name '*.deb' | wc -l)
+          echo ""
+          echo ">>> total .deb downloaded: $total"
+          du -sh /tmp/gh-debs
 
       - name: Stage pool tree
         if: ${{ inputs.mode != 'metadata-only' }}
@@ -293,6 +373,7 @@ jobs:
             done
             shopt -u nullglob
           done < "$WORK_DIR/tags-for-run.txt"
+          echo ">>> .deb staged: $(find "$POOL" -type f -name '*.deb' | wc -l)"
 
       - name: Build dists metadata
         run: |
@@ -403,12 +484,6 @@ jobs:
           [ "$bad" -gt 0 ] && { echo "::error::refusing to upload"; exit 1; }
           echo ">>> all valid"
 
-      # ==================================================================
-      # Upload — every operation is scoped to the SELECTED targets only.
-      # force_push=true → delete <target>/** for each built target,
-      #                   then re-upload pool/ and dists/ for those targets.
-      # force_push=false → delete <target>/dists/** only, then upload dists/.
-      # ==================================================================
       - name: Upload to Hugging Face
         run: |
           set -euo pipefail
@@ -434,8 +509,6 @@ jobs:
               raise SystemExit(0)
 
           def local_pool_dir(t):
-              # metadata-only → pool lives in /tmp/hf-debs
-              # full/pool-only → pool lives in /tmp/pool-tree
               if mode == "metadata-only":
                   p = "/tmp/hf-debs/" + t + "/pool"
               else:
@@ -473,7 +546,6 @@ jobs:
                           raise
               raise SystemExit(f"::error::{label} failed")
 
-          # ---------- DELETES (scoped to selected targets) ----------
           for t in built:
               if force_push:
                   print(f">>> FORCE PUSH: clearing {t}/** on HF")
@@ -494,8 +566,6 @@ jobs:
                   except Exception as e:
                       print(f">>> WARN clear {t}/dists: {type(e).__name__} {e}")
 
-          # ---------- UPLOADS ----------
-          # pool-only mode → upload only pool/, skip dists
           if mode == "pool-only":
               for t in built:
                   lp = local_pool_dir(t)
@@ -506,8 +576,6 @@ jobs:
               print(">>> done (pool-only)")
               raise SystemExit(0)
 
-          # metadata-only → upload only dists/
-          # full         → upload pool/ then dists/
           for t in built:
               if mode == "full":
                   lp = local_pool_dir(t)

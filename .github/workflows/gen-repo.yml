@@ -1,68 +1,53 @@
-name: Build APT Repository on Hugging Face
+name: Generate APT Metadata on Hugging Face
 
 on:
   workflow_dispatch:
     inputs:
+      source_repo:
+        description: "GitHub repo that hosts release tags (owner/name)"
+        required: true
+        default: "xodiosx/termux-packages"
       hf_repo_id:
         description: "Hugging Face dataset repo (username/repo-name)"
         required: true
         default: "xodiosx/xodos-packages"
       tags:
-        description: "Space/comma tags. Empty = auto-discover xodos-XoDos-* tags."
+        description: "Space/comma tags. Empty = auto-discover all xodos-XoDos-*-p<N>-* tags."
         required: false
         default: ""
       repos:
         description: "Sub-repos to include (comma-separated)"
         required: false
-        default: "main,x11,root,glibc"
-      clean_hf:
-        description: "DELETE the entire HF repo and recreate it before uploading"
-        type: boolean
-        default: false
+        default: "main,x11,root,glibc,tur,tur-on-device,tur-continuous"
 
 permissions:
   contents: read
 
 jobs:
-  build-and-publish:
+  generate-metadata:
     runs-on: ubuntu-24.04
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      HF_REPO: ${{ inputs.hf_repo_id }}
-      SRC: ${{ github.repository }}
-      CLEAN_HF: ${{ inputs.clean_hf }}
-      GH_TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
-
     steps:
 
     - name: Install tools
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq dpkg-dev apt-utils gzip zstd jq curl unzip
+        sudo apt-get install -y -qq dpkg-dev apt-utils gzip jq
         pip install -q --upgrade "huggingface_hub<1.0"
         python3 -c 'import huggingface_hub; print("huggingface_hub", huggingface_hub.__version__)'
 
-    - name: Check GitHub API rate limit
-      run: |
-        set -euo pipefail
-        limit=$(gh api rate_limit --jq '.resources.core.limit' 2>/dev/null || echo "unknown")
-        remaining=$(gh api rate_limit --jq '.resources.core.remaining' 2>/dev/null || echo "unknown")
-        echo ">>> GitHub API limit: $limit requests/hour"
-        echo ">>> Remaining:       $remaining"
-        if [ "$limit" = "1000" ]; then
-          echo "::warning::Using an installation token (1000/hr). Set GH_PUSH_TOKEN to a PAT for 5000/hr."
-        fi
-
-    - name: Resolve tags
+    # ==================================================================
+    # 1. Resolve tags + group by repo
+    # ==================================================================
+    - name: Resolve and group tags
       env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SRC: ${{ inputs.source_repo }}
         INPUT_TAGS: ${{ inputs.tags }}
         INPUT_REPOS: ${{ inputs.repos }}
       run: |
         set -euo pipefail
         mkdir -p /tmp/plan
         : > /tmp/plan/groups.txt
-
-        echo ">>> Repo: $SRC"
 
         if [ -n "$INPUT_TAGS" ]; then
           read -a TAGS <<< "${INPUT_TAGS//,/ }"
@@ -77,174 +62,93 @@ jobs:
 
         if [ "${#TAGS[@]}" -eq 0 ]; then
           echo "::error::No tags found"
-          gh release list --repo "$SRC" --limit 20 || true
+          gh release list --repo "$SRC" --limit 30 || true
           exit 1
         fi
 
         for tag in "${TAGS[@]}"; do
           case "$tag" in
-            xodos-XoDos-main-p*)  printf 'main\t%s\n'  "$tag" >> /tmp/plan/groups.txt ;;
-            xodos-XoDos-x11-p*)   printf 'x11\t%s\n'   "$tag" >> /tmp/plan/groups.txt ;;
-            xodos-XoDos-root-p*)  printf 'root\t%s\n'  "$tag" >> /tmp/plan/groups.txt ;;
-            xodos-XoDos-glibc-p*) printf 'glibc\t%s\n' "$tag" >> /tmp/plan/groups.txt ;;
+            xodos-XoDos-tur-continuous-p*) printf 'tur-continuous\t%s\n' "$tag" >> /tmp/plan/groups.txt ;;
+            xodos-XoDos-tur-on-device-p*)  printf 'tur-on-device\t%s\n'  "$tag" >> /tmp/plan/groups.txt ;;
+            xodos-XoDos-tur-p*)            printf 'tur\t%s\n'            "$tag" >> /tmp/plan/groups.txt ;;
+            xodos-XoDos-main-p*)           printf 'main\t%s\n'           "$tag" >> /tmp/plan/groups.txt ;;
+            xodos-XoDos-x11-p*)            printf 'x11\t%s\n'            "$tag" >> /tmp/plan/groups.txt ;;
+            xodos-XoDos-root-p*)           printf 'root\t%s\n'           "$tag" >> /tmp/plan/groups.txt ;;
+            xodos-XoDos-glibc-p*)          printf 'glibc\t%s\n'          "$tag" >> /tmp/plan/groups.txt ;;
+            *) echo ">>> skipped (unrecognised): $tag" ;;
           esac
         done
 
         cut -f1 /tmp/plan/groups.txt | sort -u > /tmp/plan/repos.txt
-        echo ">>> Groups:"
+        echo ">>> Repos present:"
+        sed 's/^/    /' /tmp/plan/repos.txt
+        echo ""
+        echo ">>> Full tag → repo mapping:"
         sort /tmp/plan/groups.txt | sed 's/^/    /'
 
-    - name: Clean Hugging Face repo
-      if: ${{ inputs.clean_hf }}
-      run: |
-        set -euo pipefail
-        python3 -c "
-        import os
-        from huggingface_hub import HfApi
-        from huggingface_hub.utils import RepositoryNotFoundError
-        api = HfApi()
-        repo = os.environ['HF_REPO']
-        token = os.environ['HF_TOKEN']
-        try:
-            api.delete_repo(repo_id=repo, repo_type='dataset', token=token)
-            print('>>> deleted:', repo)
-        except RepositoryNotFoundError:
-            print('>>> repo did not exist')
-        except Exception as e:
-            print('>>> WARN:', type(e).__name__, e)
-        api.create_repo(repo_id=repo, repo_type='dataset', exist_ok=True, token=token)
-        print('>>> recreated empty:', repo)
-        "
-
     # ==================================================================
-    # Download — the print-sample line no longer pipes find into head.
+    # 2. Download .deb from GitHub (metadata only)
     # ==================================================================
-    - name: Download from GitHub Releases
+    - name: Download .deb from GitHub (metadata only)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SRC: ${{ inputs.source_repo }}
       run: |
         set -euo pipefail
         rm -rf /tmp/raw-debs
         mkdir -p /tmp/raw-debs
 
-        download_with_retry() {
-          local tag="$1" dest="$2"
-          local attempt=1
-          local max_attempts=5
-          while [ "$attempt" -le "$max_attempts" ]; do
-            if gh release download "$tag" --repo "$SRC" --dir "$dest" 2>/tmp/dl_err.log; then
-              return 0
-            fi
-            if grep -qiE 'rate limit|403|429|secondary' /tmp/dl_err.log; then
-              local backoff=$((attempt * 30))
-              echo "        rate limited (attempt $attempt/$max_attempts), sleeping ${backoff}s"
-              sleep "$backoff"
-            else
-              echo "        download error (attempt $attempt/$max_attempts):"
-              head -3 /tmp/dl_err.log | sed 's/^/            /'
-              local backoff=$((attempt * 5))
-              sleep "$backoff"
-            fi
-            attempt=$((attempt + 1))
-          done
-          return 1
-        }
-
         while IFS= read -r repo; do
           [ -z "$repo" ] && continue
-          echo "=================================================="
           echo ">>> repo: $repo"
-          echo "=================================================="
           mkdir -p "/tmp/raw-debs/$repo"
-
           while IFS= read -r tag; do
             [ -z "$tag" ] && continue
-            echo ">>> tag: $tag"
-
+            echo "    downloading: $tag"
             tmpdir=$(mktemp -d)
-            if ! download_with_retry "$tag" "$tmpdir"; then
-              echo "    FAIL: gave up on $tag"
-              rm -rf "$tmpdir"
-              continue
-            fi
-
-            count_all=$(find "$tmpdir" -maxdepth 1 -type f | wc -l)
-            count_deb=$(find "$tmpdir" -maxdepth 1 -type f -name '*.deb' | wc -l)
-            echo "    assets: $count_all total, $count_deb .deb"
-
-            # FIX: write listing to file first, then head the file.
-            find "$tmpdir" -maxdepth 1 -type f -printf '%f\n' > /tmp/asset-list.txt
-            if [ "$count_all" -le 5 ]; then
-              sed 's/^/        /' /tmp/asset-list.txt
-            else
-              echo "        (showing first 3)"
-              head -3 /tmp/asset-list.txt | sed 's/^/        /'
-              echo "        ..."
-            fi
-
-            if [ "$count_deb" -gt 0 ]; then
+            if gh release download "$tag" --repo "$SRC" \
+                 --pattern "*.deb" --dir "$tmpdir" 2>/dev/null
+            then
+              n=$(find "$tmpdir" -maxdepth 1 -type f -name '*.deb' | wc -l)
+              echo "    got $n .deb"
               find "$tmpdir" -maxdepth 1 -type f -name '*.deb' -print0 \
                 | xargs -0r mv -t "/tmp/raw-debs/$repo/"
             fi
-
-            shopt -s nullglob
-            for arc in "$tmpdir"/*.tar.xz "$tmpdir"/*.tar.gz "$tmpdir"/*.tgz "$tmpdir"/*.zip; do
-              [ -f "$arc" ] || continue
-              echo "    extracting $(basename "$arc")"
-              extract="$tmpdir/extract"
-              rm -rf "$extract"
-              mkdir -p "$extract"
-              case "$arc" in
-                *.tar.xz)       tar -xJf "$arc" -C "$extract" 2>/dev/null || true ;;
-                *.tar.gz|*.tgz) tar -xzf "$arc" -C "$extract" 2>/dev/null || true ;;
-                *.zip)          unzip -q "$arc" -d "$extract" 2>/dev/null || true ;;
-              esac
-              ex=$(find "$extract" -type f -name '*.deb' | wc -l)
-              echo "        extracted $ex .deb"
-              find "$extract" -type f -name '*.deb' -print0 \
-                | xargs -0r mv -t "/tmp/raw-debs/$repo/"
-              rm -rf "$extract"
-            done
-            shopt -u nullglob
-
             rm -rf "$tmpdir"
-            sleep 3
           done < <(grep -P "^${repo}\t" /tmp/plan/groups.txt | cut -f2)
 
-          total=$(find "/tmp/raw-debs/$repo" -maxdepth 1 -type f -name '*.deb' | wc -l)
+          total=$(find "/tmp/raw-debs/$repo" -maxdepth 1 -type f -name '*.deb' 2>/dev/null | wc -l)
           echo ">>> repo $repo: $total .deb total"
         done < /tmp/plan/repos.txt
 
-        grand=$(find /tmp/raw-debs -type f -name '*.deb' | wc -l)
-        echo ""
-        echo "=================================================="
-        echo ">>> GRAND TOTAL: $grand .deb file(s)"
-        echo "=================================================="
-        if [ "$grand" -eq 0 ]; then
-          echo "::error::0 .deb files downloaded"
-          exit 1
-        fi
-
-    - name: Build APT repository tree
+    # ==================================================================
+    # 3. Build Packages files
+    # ==================================================================
+    - name: Build Packages files
       run: |
         set -euo pipefail
         BUILD=/tmp/aptrepo
         rm -rf "$BUILD"
         mkdir -p "$BUILD"
-        : > /tmp/override.empty
 
         while IFS= read -r repo; do
           [ -z "$repo" ] && continue
           case "$repo" in
-            main)  dist=stable; comp=main ;;
-            x11)   dist=x11;    comp=main ;;
-            root)  dist=root;   comp=stable ;;
-            glibc) dist=glibc;  comp=main ;;
-            *)     continue ;;
+            main)           target=xodos-main;  dist=stable;       comp=main ;;
+            x11)            target=xodos-x11;   dist=x11;          comp=main ;;
+            root)           target=xodos-root;  dist=root;         comp=stable ;;
+            glibc)          target=xodos-glibc; dist=glibc;        comp=main ;;
+            tur)            target=xodos-tur;   dist=tur-packages; comp=tur ;;
+            tur-on-device)  target=xodos-tur;   dist=tur-packages; comp=tur-on-device ;;
+            tur-continuous) target=xodos-tur;   dist=tur-packages; comp=tur-continuous ;;
+            *) echo ">>> skip unknown repo: $repo"; continue ;;
           esac
 
-          echo ">>> building xodos-${repo}  (dist=$dist comp=$comp)"
-          outdir="$BUILD/xodos-${repo}"
-          pooldir="$outdir/pool/${comp}"
-          mkdir -p "$pooldir"
+          echo ">>> building $target/dists/$dist/$comp  (source repo: $repo)"
+
+          outd="$BUILD/$target/dists/$dist/$comp/binary-aarch64"
+          mkdir -p "$outd"
+          : > "$outd/Packages"
 
           tsv="/tmp/all-${repo}.tsv"
           : > "$tsv"
@@ -259,141 +163,149 @@ jobs:
 
           in_count=$(wc -l < "$tsv")
           echo "    input .deb: $in_count"
-          [ "$in_count" -eq 0 ] && { echo "::error::no valid .deb for $repo"; exit 1; }
+          if [ "$in_count" -eq 0 ]; then
+            echo "    WARN: no .deb for $repo — skipping"
+            continue
+          fi
 
           sort -t$'\t' -k1,1 -k2,2rV "$tsv" | awk -F'\t' '!seen[$1]++' > "/tmp/winners-${repo}.tsv"
 
           placed=0
           while IFS=$'\t' read -r pkg ver path; do
             [ -z "$pkg" ] && continue
-            fl=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
-            dest="${pooldir}/${fl}/${pkg}"
-            mkdir -p "$dest"
-            cp -a "$path" "$dest/"
+            fname=$(basename "$path")
+            size=$(stat -c %s "$path")
+            md5=$(md5sum "$path" | awk '{print $1}')
+            sha1=$(sha1sum "$path" | awk '{print $1}')
+            sha256=$(sha256sum "$path" | awk '{print $1}')
+
+            dpkg-deb -f "$path" >> "$outd/Packages"
+            {
+              echo "Filename: ${fname}"
+              echo "Size: ${size}"
+              echo "MD5sum: ${md5}"
+              echo "SHA1: ${sha1}"
+              echo "SHA256: ${sha256}"
+              echo ""
+            } >> "$outd/Packages"
             placed=$((placed + 1))
           done < "/tmp/winners-${repo}.tsv"
 
-          pool_count=$(find "$pooldir" -type f -name '*.deb' | wc -l)
-          echo "    placed ${placed}, pool now has ${pool_count} .deb"
-          [ "$pool_count" -eq 0 ] && { echo "::error::pool empty for $repo"; exit 1; }
-
-          dists="$outdir/dists/${dist}/${comp}"
-          mkdir -p "$dists/binary-aarch64" "$dists/binary-all"
-
-          cd "$outdir"
-          dpkg-scanpackages --multiversion "pool/${comp}" /tmp/override.empty \
-            > "dists/${dist}/${comp}/binary-aarch64/Packages"
-          dpkg-scanpackages --multiversion --arch all "pool/${comp}" /tmp/override.empty \
-            > "dists/${dist}/${comp}/binary-all/Packages"
-          cd - >/dev/null
-
-          gzip -kf -9 "$dists/binary-aarch64/Packages"
-          gzip -kf -9 "$dists/binary-all/Packages"
-          rm -f "$dists/binary-aarch64/Packages.xz" "$dists/binary-all/Packages.xz"
-
-          echo "    binary-aarch64: $(grep -c '^Package:' "$dists/binary-aarch64/Packages")"
-          echo "    binary-all:     $(grep -c '^Package:' "$dists/binary-all/Packages")"
-
-          conf="/tmp/release-${repo}.conf"
-          {
-            echo 'APT::FTPArchive::Release::Origin "xodos";'
-            echo "APT::FTPArchive::Release::Label \"xodos Termux ${repo}\";"
-            echo "APT::FTPArchive::Release::Suite \"${dist}\";"
-            echo "APT::FTPArchive::Release::Codename \"${dist}\";"
-            echo 'APT::FTPArchive::Release::Architectures "aarch64 all";'
-            echo "APT::FTPArchive::Release::Components \"${comp}\";"
-            echo "APT::FTPArchive::Release::Description \"xodos Termux ${repo} packages\";"
-          } > "$conf"
-          cd "$outdir"
-          apt-ftparchive -c "$conf" release "dists/${dist}" > "dists/${dist}/Release"
-          cp "dists/${dist}/Release" "dists/${dist}/InRelease"
-          cd - >/dev/null
+          echo "    entries: $placed"
+          gzip -kf -9 "$outd/Packages"
+          rm -f "$outd/Packages.xz"
         done < /tmp/plan/repos.txt
 
-        cat > "$BUILD/README.md" <<'EOF'
-        # xodos-packages
+    # ==================================================================
+    # 4. Generate Release files
+    # ==================================================================
+    - name: Generate Release files
+      run: |
+        set -euo pipefail
+        BUILD=/tmp/aptrepo
+        cd "$BUILD"
 
-        APT repository for xodos Termux packages (aarch64).
+        for target in xodos-main xodos-x11 xodos-root xodos-glibc xodos-tur; do
+          [ -d "$target/dists" ] || continue
+          for dist_dir in "$target"/dists/*/; do
+            [ -d "$dist_dir" ] || continue
+            dist="$(basename "$dist_dir")"
 
-        ## sources.list
+            comps=""
+            for comp_dir in "$dist_dir"*/; do
+              [ -d "$comp_dir" ] || continue
+              comp="$(basename "$comp_dir")"
+              if [ -d "$comp_dir/binary-aarch64" ] && [ -s "$comp_dir/binary-aarch64/Packages" ]; then
+                comps="${comps}${comps:+ }$comp"
+              fi
+            done
 
-        ```
-        deb [trusted=yes] https://huggingface.co/datasets/xodiosx/xodos-packages/resolve/main/xodos-main stable main
-        deb [trusted=yes] https://huggingface.co/datasets/xodiosx/xodos-packages/resolve/main/xodos-x11 x11 main
-        deb [trusted=yes] https://huggingface.co/datasets/xodiosx/xodos-packages/resolve/main/xodos-root root stable
-        deb [trusted=yes] https://huggingface.co/datasets/xodiosx/xodos-packages/resolve/main/xodos-glibc glibc main
-        ```
-        EOF
+            if [ -z "$comps" ]; then
+              echo ">>> skip empty dist: $target/dists/$dist"
+              continue
+            fi
+
+            conf="/tmp/release-${target}-${dist}.conf"
+            {
+              echo 'APT::FTPArchive::Release::Origin "xodos";'
+              echo "APT::FTPArchive::Release::Label \"xodos ${target}/${dist}\";"
+              echo "APT::FTPArchive::Release::Suite \"${dist}\";"
+              echo "APT::FTPArchive::Release::Codename \"${dist}\";"
+              echo 'APT::FTPArchive::Release::Architectures "aarch64";'
+              echo "APT::FTPArchive::Release::Components \"${comps}\";"
+              echo "APT::FTPArchive::Release::Description \"xodos ${target} (${dist})\";"
+            } > "$conf"
+
+            echo ">>> release: $target/dists/$dist  (comps: $comps)"
+            apt-ftparchive -c "$conf" release "$target/dists/$dist" \
+              > "$target/dists/$dist/Release"
+            cp "$target/dists/$dist/Release" "$target/dists/$dist/InRelease"
+          done
+        done
 
         echo ""
-        echo ">>> total .deb: $(find "$BUILD" -type f -name '*.deb' | wc -l)"
+        echo ">>> final tree:"
+        find "$BUILD" -type f | sort | sed 's/^/    /'
+        echo ""
         echo ">>> total size: $(du -sh "$BUILD" | awk '{print $1}')"
 
-    - name: Ensure HF repo exists
-      run: |
-        set -euo pipefail
-        python3 -c "
-        import os
-        from huggingface_hub import HfApi
-        HfApi().create_repo(
-            repo_id=os.environ['HF_REPO'],
-            repo_type='dataset',
-            exist_ok=True,
-            token=os.environ['HF_TOKEN'],
-        )
-        print('>>> repo ready:', os.environ['HF_REPO'])
-        "
-
+    # ==================================================================
+    # 5. Upload to Hugging Face
+    #    Inline python3 -c to avoid heredoc indentation issues.
+    # ==================================================================
     - name: Upload to Hugging Face
-      run: |
-        set -euo pipefail
-        local_deb=$(find /tmp/aptrepo -type f -name '*.deb' | wc -l)
-        echo ">>> local .deb: $local_deb"
-        [ "$local_deb" -eq 0 ] && { echo "::error::nothing to upload"; exit 1; }
-
-        python3 -c "
-        import os
-        from huggingface_hub import HfApi
-        print('>>> HF_TOKEN set:', bool(os.environ.get('HF_TOKEN')))
-        print('>>> starting upload_large_folder...')
-        HfApi().upload_large_folder(
-            folder_path='/tmp/aptrepo',
-            repo_id=os.environ['HF_REPO'],
-            repo_type='dataset',
-            num_workers=4,
-        )
-        print('>>> upload complete')
-        "
-
-    - name: Verify
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        HF_REPO: ${{ inputs.hf_repo_id }}
       run: |
         set -euo pipefail
         python3 -c "
-        import os
+        import os, sys
         from huggingface_hub import HfApi
         api = HfApi()
-        files = list(api.list_repo_files(repo_id=os.environ['HF_REPO'], repo_type='dataset', token=os.environ['HF_TOKEN']))
-        print('>>> files on HF:', len(files))
-        deb = [f for f in files if f.endswith('.deb')]
-        print('>>> .deb on HF:', len(deb))
-        for f in deb[:10]:
-            print('    ', f)
-        if len(deb) == 0:
-            raise SystemExit('::error::no .deb files on HF after upload')
+        repo = os.environ['HF_REPO']
+        token = os.environ['HF_TOKEN']
+        api.create_repo(repo_id=repo, repo_type='dataset', exist_ok=True, token=token)
+        print('>>> HF repo ready:', repo)
+        targets = ['xodos-main', 'xodos-x11', 'xodos-root', 'xodos-glibc', 'xodos-tur']
+        for t in targets:
+            local = '/tmp/aptrepo/' + t
+            if not os.path.isdir(local):
+                print('>>> skip ' + t + ' (not built this run)')
+                continue
+            print('>>> uploading ' + t + '/ ...')
+            api.upload_folder(
+                folder_path=local,
+                path_in_repo=t,
+                repo_id=repo,
+                repo_type='dataset',
+                token=token,
+                commit_message='Update ' + t + ' APT metadata',
+                delete_patterns=['*'],
+            )
+            print('>>> ' + t + '/ uploaded')
+        print('>>> all done')
         "
 
     - name: Summary
       run: |
         {
-          echo "## APT Repository on Hugging Face"
+          echo "## APT Metadata Published"
           echo ""
-          echo "- Repo: https://huggingface.co/datasets/${{ inputs.hf_repo_id }}"
+          echo "Base: \`https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main\`"
           echo ""
-          echo "### sources.list"
+          echo "### sources.list entries"
+          echo ""
+          echo '**Official Termux repos (mirrored by xodos):**'
           echo '```'
           echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-main stable main"
           echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-x11 x11 main"
           echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-root root stable"
           echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-glibc glibc main"
+          echo '```'
+          echo ""
+          echo '**TUR (mirrored by xodos):**'
+          echo '```'
+          echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-tur tur-packages tur tur-on-device tur-continuous"
           echo '```'
         } >> $GITHUB_STEP_SUMMARY

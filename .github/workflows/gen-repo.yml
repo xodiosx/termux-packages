@@ -19,8 +19,8 @@ on:
         description: "Sub-repos to include (comma-separated)"
         required: false
         default: "main,x11,root,glibc"
-      clean_hf:
-        description: "DELETE the entire HF repo and recreate it before uploading"
+      wipe_hf:
+        description: "WARNING: delete ALL files on HF before uploading. Keep FALSE to preserve existing .deb files."
         type: boolean
         default: false
 
@@ -34,25 +34,33 @@ jobs:
       HF_REPO: ${{ inputs.hf_repo_id }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       SRC: ${{ inputs.source_repo }}
-      CLEAN_HF: ${{ inputs.clean_hf }}
     steps:
 
     - name: Install tools
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq dpkg-dev apt-utils gzip zstd jq curl
+        sudo apt-get install -y -qq dpkg-dev apt-utils gzip zstd jq curl unzip
         pip install -q --upgrade "huggingface_hub<1.0"
         python3 -c 'import huggingface_hub; print("huggingface_hub", huggingface_hub.__version__)'
 
+    # ==================================================================
+    # 1. Resolve tags
+    # ==================================================================
     - name: Resolve tags
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN || secrets.GITHUB_TOKEN }}
         INPUT_TAGS: ${{ inputs.tags }}
         INPUT_REPOS: ${{ inputs.repos }}
       run: |
         set -euo pipefail
         mkdir -p /tmp/plan
         : > /tmp/plan/groups.txt
+
+        echo ">>> checking access to $SRC ..."
+        gh api "repos/$SRC" --jq '.full_name' >/dev/null 2>&1 || {
+          echo "::error::cannot access $SRC — set SOURCE_REPO_TOKEN with read access"
+          exit 1
+        }
 
         if [ -n "$INPUT_TAGS" ]; then
           read -a TAGS <<< "${INPUT_TAGS//,/ }"
@@ -66,7 +74,7 @@ jobs:
         fi
 
         if [ "${#TAGS[@]}" -eq 0 ]; then
-          echo "::error::No tags found"; exit 1
+          echo "::error::no tags found"; exit 1
         fi
 
         for tag in "${TAGS[@]}"; do
@@ -77,13 +85,15 @@ jobs:
             xodos-XoDos-glibc-p*) printf 'glibc\t%s\n' "$tag" >> /tmp/plan/groups.txt ;;
           esac
         done
-
         cut -f1 /tmp/plan/groups.txt | sort -u > /tmp/plan/repos.txt
-        echo ">>> Groups:"
+        echo ">>> groups:"
         sort /tmp/plan/groups.txt | sed 's/^/    /'
 
-    - name: Clean Hugging Face repo
-      if: ${{ inputs.clean_hf }}
+    # ==================================================================
+    # 2. Optionally wipe HF (default false)
+    # ==================================================================
+    - name: Wipe HF repo
+      if: ${{ inputs.wipe_hf }}
       run: |
         set -euo pipefail
         python3 -c "
@@ -91,22 +101,22 @@ jobs:
         from huggingface_hub import HfApi
         from huggingface_hub.utils import RepositoryNotFoundError
         api = HfApi()
-        repo = os.environ['HF_REPO']
-        token = os.environ['HF_TOKEN']
+        repo = os.environ['HF_REPO']; token = os.environ['HF_TOKEN']
         try:
             api.delete_repo(repo_id=repo, repo_type='dataset', token=token)
             print('>>> deleted:', repo)
         except RepositoryNotFoundError:
             print('>>> repo did not exist')
-        except Exception as e:
-            print('>>> WARN: delete failed:', type(e).__name__, e)
         api.create_repo(repo_id=repo, repo_type='dataset', exist_ok=True, token=token)
         print('>>> recreated empty:', repo)
         "
 
-    - name: Download .deb from GitHub Releases
+    # ==================================================================
+    # 3. Download from GitHub Releases (accepts .deb and archives)
+    # ==================================================================
+    - name: Download from GitHub Releases
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN || secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
         rm -rf /tmp/raw-debs
@@ -114,29 +124,68 @@ jobs:
 
         while IFS= read -r repo; do
           [ -z "$repo" ] && continue
+          echo "=================================================="
           echo ">>> repo: $repo"
+          echo "=================================================="
           mkdir -p "/tmp/raw-debs/$repo"
+
           while IFS= read -r tag; do
             [ -z "$tag" ] && continue
-            echo "    downloading: $tag"
+            echo ">>> tag: $tag"
+
             tmpdir=$(mktemp -d)
-            if gh release download "$tag" --repo "$SRC" \
-                 --pattern "*.deb" --dir "$tmpdir" 2>/tmp/dl_err.log
-            then
-              n=$(find "$tmpdir" -maxdepth 1 -type f -name '*.deb' | wc -l)
-              echo "    got $n .deb"
+            if ! gh release download "$tag" --repo "$SRC" --dir "$tmpdir" 2>/tmp/dl_err.log; then
+              echo "    FAIL: $tag"
+              head -5 /tmp/dl_err.log | sed 's/^/        /' || true
+              rm -rf "$tmpdir"; continue
+            fi
+
+            echo "    release assets:"
+            find "$tmpdir" -maxdepth 1 -type f -printf '        %f  (%s bytes)\n'
+
+            # Direct .deb files
+            direct=$(find "$tmpdir" -maxdepth 1 -type f -name '*.deb' | wc -l)
+            if [ "$direct" -gt 0 ]; then
+              echo "    direct .deb: $direct"
               find "$tmpdir" -maxdepth 1 -type f -name '*.deb' -print0 \
                 | xargs -0r mv -t "/tmp/raw-debs/$repo/"
-            else
-              echo "    WARN: failed to download $tag"
-              head -3 /tmp/dl_err.log | sed 's/^/        /' || true
             fi
+
+            # Fallback: extract archives if any (this run or future ones)
+            shopt -s nullglob
+            for arc in "$tmpdir"/*.tar.xz "$tmpdir"/*.tar.gz "$tmpdir"/*.tgz "$tmpdir"/*.zip; do
+              [ -f "$arc" ] || continue
+              echo "    extracting $(basename "$arc")"
+              ex="$tmpdir/ex"; rm -rf "$ex"; mkdir -p "$ex"
+              case "$arc" in
+                *.tar.xz)       tar -xJf "$arc" -C "$ex" ;;
+                *.tar.gz|*.tgz) tar -xzf "$arc" -C "$ex" ;;
+                *.zip)          unzip -q "$arc" -d "$ex" ;;
+              esac
+              n=$(find "$ex" -type f -name '*.deb' | wc -l)
+              echo "        extracted $n .deb"
+              find "$ex" -type f -name '*.deb' -print0 | xargs -0r mv -t "/tmp/raw-debs/$repo/"
+              rm -rf "$ex"
+            done
+            shopt -u nullglob
+
             rm -rf "$tmpdir"
           done < <(grep -P "^${repo}\t" /tmp/plan/groups.txt | cut -f2)
-          total=$(find "/tmp/raw-debs/$repo" -maxdepth 1 -type f -name '*.deb' | wc -l)
-          echo "    repo $repo total: $total"
+
+          echo ">>> repo $repo total: $(find "/tmp/raw-debs/$repo" -maxdepth 1 -type f -name '*.deb' | wc -l)"
         done < /tmp/plan/repos.txt
 
+        grand=$(find /tmp/raw-debs -type f -name '*.deb' | wc -l)
+        echo ""
+        echo ">>> grand total downloaded: $grand .deb files"
+        if [ "$grand" -eq 0 ]; then
+          echo "::error::0 .deb downloaded — refusing to continue"
+          exit 1
+        fi
+
+    # ==================================================================
+    # 4. Build full APT tree
+    # ==================================================================
     - name: Build APT repository tree
       run: |
         set -euo pipefail
@@ -155,24 +204,24 @@ jobs:
             *)     continue ;;
           esac
 
-          echo "=================================================="
-          echo ">>> building: xodos-${repo}  (dist=$dist comp=$comp)"
-          echo "=================================================="
-
           outdir="$BUILD/xodos-${repo}"
           pooldir="$outdir/pool/${comp}"
           mkdir -p "$pooldir"
 
-          tsv="/tmp/all-${repo}.tsv"
-          : > "$tsv"
+          tsv="/tmp/all-${repo}.tsv"; : > "$tsv"
           shopt -s nullglob
           for deb in /tmp/raw-debs/"$repo"/*.deb; do
             dpkg-deb -I "$deb" >/dev/null 2>&1 || continue
-            pkg=$(dpkg-deb -f "$deb" Package)
-            ver=$(dpkg-deb -f "$deb" Version)
-            printf '%s\t%s\t%s\n' "$pkg" "$ver" "$deb" >> "$tsv"
+            printf '%s\t%s\t%s\n' \
+              "$(dpkg-deb -f "$deb" Package)" \
+              "$(dpkg-deb -f "$deb" Version)" \
+              "$deb" >> "$tsv"
           done
           shopt -u nullglob
+
+          n=$(wc -l < "$tsv")
+          echo ">>> $repo: $n valid .deb"
+          [ "$n" -eq 0 ] && { echo "::error::empty for $repo"; exit 1; }
 
           winners="/tmp/winners-${repo}.tsv"
           sort -t$'\t' -k1,1 -k2,2rV "$tsv" | awk -F'\t' '!seen[$1]++' > "$winners"
@@ -180,31 +229,27 @@ jobs:
           placed=0
           while IFS=$'\t' read -r pkg ver path; do
             [ -z "$pkg" ] && continue
-            first_letter=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
-            dest_dir="${pooldir}/${first_letter}/${pkg}"
-            mkdir -p "$dest_dir"
-            cp -a "$path" "$dest_dir/"
+            fl=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
+            dd="${pooldir}/${fl}/${pkg}"
+            mkdir -p "$dd"
+            cp -a "$path" "$dd/"
             placed=$((placed + 1))
           done < "$winners"
-          echo ">>> placed ${placed} unique packages in pool"
-          echo ">>> pool size: $(find "$pooldir" -type f -name '*.deb' | wc -l) .deb"
+          echo ">>> $repo pool: $(find "$pooldir" -type f -name '*.deb' | wc -l) .deb"
 
           dists="$outdir/dists/${dist}/${comp}"
           mkdir -p "$dists/binary-aarch64" "$dists/binary-all"
 
           cd "$outdir"
-          dpkg-scanpackages --multiversion "pool/${comp}" /tmp/override.empty \
-            > "dists/${dist}/${comp}/binary-aarch64/Packages"
-          dpkg-scanpackages --multiversion --arch all "pool/${comp}" /tmp/override.empty \
-            > "dists/${dist}/${comp}/binary-all/Packages"
+          dpkg-scanpackages --multiversion "pool/${comp}" /tmp/override.empty > "dists/${dist}/${comp}/binary-aarch64/Packages"
+          dpkg-scanpackages --multiversion --arch all "pool/${comp}" /tmp/override.empty > "dists/${dist}/${comp}/binary-all/Packages"
           cd - >/dev/null
 
           gzip -kf -9 "$dists/binary-aarch64/Packages"
           gzip -kf -9 "$dists/binary-all/Packages"
           rm -f "$dists/binary-aarch64/Packages.xz" "$dists/binary-all/Packages.xz"
 
-          echo "    binary-aarch64: $(grep -c '^Package:' "$dists/binary-aarch64/Packages" || true)"
-          echo "    binary-all:     $(grep -c '^Package:' "$dists/binary-all/Packages" || true)"
+          echo ">>> $repo entries: $(grep -c '^Package:' "$dists/binary-aarch64/Packages" || true)"
 
           conf="/tmp/release-${repo}.conf"
           {
@@ -214,7 +259,7 @@ jobs:
             echo "APT::FTPArchive::Release::Codename \"${dist}\";"
             echo 'APT::FTPArchive::Release::Architectures "aarch64 all";'
             echo "APT::FTPArchive::Release::Components \"${comp}\";"
-            echo "APT::FTPArchive::Release::Description \"xodos Termux ${repo} packages\";"
+            echo "APT::FTPArchive::Release::Description \"xodos Termux ${repo}\";"
           } > "$conf"
 
           cd "$outdir"
@@ -223,27 +268,15 @@ jobs:
           cd - >/dev/null
         done < /tmp/plan/repos.txt
 
-        cat > "$BUILD/README.md" <<'READMEEOF'
+        cat > "$BUILD/README.md" <<'EOF'
         # xodos-packages
 
         APT repository for xodos Termux packages (aarch64).
-
-        ## sources.list
-
-        ```
-        deb [trusted=yes] https://huggingface.co/datasets/xodiosx/xodos-packages/resolve/main/xodos-main stable main
-        deb [trusted=yes] https://huggingface.co/datasets/xodiosx/xodos-packages/resolve/main/xodos-x11 x11 main
-        deb [trusted=yes] https://huggingface.co/datasets/xodiosx/xodos-packages/resolve/main/xodos-root root stable
-        deb [trusted=yes] https://huggingface.co/datasets/xodiosx/xodos-packages/resolve/main/xodos-glibc glibc main
-        ```
-        READMEEOF
+        EOF
 
         echo ""
-        echo ">>> final tree:"
-        find "$BUILD" -maxdepth 3 -type d | sort | sed 's/^/    /'
-        echo ""
-        echo ">>> size: $(du -sh "$BUILD" | awk '{print $1}')"
-        echo ">>> total .deb files: $(find "$BUILD" -type f -name '*.deb' | wc -l)"
+        echo ">>> total .deb: $(find "$BUILD" -type f -name '*.deb' | wc -l)"
+        echo ">>> total size: $(du -sh "$BUILD" | awk '{print $1}')"
 
     - name: Ensure HF repo exists
       run: |
@@ -251,29 +284,30 @@ jobs:
         python3 -c "
         import os
         from huggingface_hub import HfApi
-        api = HfApi()
-        api.create_repo(
-            repo_id=os.environ['HF_REPO'],
-            repo_type='dataset',
-            exist_ok=True,
-            token=os.environ['HF_TOKEN'],
-        )
-        print('>>> repo ready:', os.environ['HF_REPO'])
+        HfApi().create_repo(repo_id=os.environ['HF_REPO'], repo_type='dataset', exist_ok=True, token=os.environ['HF_TOKEN'])
+        print('>>> repo ready')
         "
 
     # ==================================================================
-    # Upload — FIXED: no token argument. HF_TOKEN env var is picked up
-    # automatically by upload_large_folder.
+    # 5. Upload (upload_large_folder — no token arg)
     # ==================================================================
-    - name: Upload to Hugging Face (upload_large_folder)
+    - name: Upload to Hugging Face
       run: |
         set -euo pipefail
+        echo ">>> pre-upload check:"
+        echo "    .deb: $(find /tmp/aptrepo -type f -name '*.deb' | wc -l)"
+        echo "    all:  $(find /tmp/aptrepo -type f | wc -l)"
+        echo "    size: $(du -sh /tmp/aptrepo | awk '{print $1}')"
+
+        if [ "$(find /tmp/aptrepo -type f -name '*.deb' | wc -l)" -eq 0 ]; then
+          echo "::error::nothing to upload"; exit 1
+        fi
+
         python3 -c "
         import os
         from huggingface_hub import HfApi
         api = HfApi()
         print('>>> starting upload_large_folder...')
-        print('>>> HF_TOKEN is set:', bool(os.environ.get('HF_TOKEN')))
         api.upload_large_folder(
             folder_path='/tmp/aptrepo',
             repo_id=os.environ['HF_REPO'],
@@ -286,50 +320,14 @@ jobs:
     - name: Verify
       run: |
         set -euo pipefail
-        base="https://huggingface.co/datasets/${HF_REPO}/resolve/main"
-        ok=0; bad=0
-        for f in \
-          "xodos-main/dists/stable/Release" \
-          "xodos-main/dists/stable/main/binary-aarch64/Packages.gz" \
-          "xodos-x11/dists/x11/Release" \
-          "xodos-x11/dists/x11/main/binary-aarch64/Packages.gz" \
-          "xodos-root/dists/root/Release" \
-          "xodos-glibc/dists/glibc/Release"; do
-          code=$(curl -s -o /dev/null -w "%{http_code}" "$base/$f")
-          if [ "$code" = "200" ]; then
-            echo "  OK   $f"; ok=$((ok+1))
-          else
-            echo "  $code  $f"; bad=$((bad+1))
-          fi
-        done
-        echo ">>> ok=$ok bad=$bad"
-        echo ""
-        echo ">>> files on HF:"
         python3 -c "
         import os
         from huggingface_hub import HfApi
-        api = HfApi()
-        files = list(api.list_repo_files(repo_id=os.environ['HF_REPO'], repo_type='dataset', token=os.environ['HF_TOKEN']))
-        print('    total:', len(files))
+        files = list(HfApi().list_repo_files(repo_id=os.environ['HF_REPO'], repo_type='dataset', token=os.environ['HF_TOKEN']))
+        print('>>> total files on HF:', len(files))
         deb = [f for f in files if f.endswith('.deb')]
-        print('    .deb:', len(deb))
-        for f in deb[:5]:
-            print('      ', f)
+        print('>>> .deb on HF:', len(deb))
+        for f in deb[:10]: print('    ', f)
+        if not deb:
+            raise SystemExit('::error::no .deb on HF')
         "
-
-    - name: Summary
-      run: |
-        {
-          echo "## APT Repository on Hugging Face"
-          echo ""
-          echo "- HF repo: https://huggingface.co/datasets/${{ inputs.hf_repo_id }}"
-          echo "- clean_hf: \`${{ inputs.clean_hf }}\`"
-          echo ""
-          echo "### sources.list"
-          echo '```'
-          echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-main stable main"
-          echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-x11 x11 main"
-          echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-root root stable"
-          echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-glibc glibc main"
-          echo '```'
-        } >> $GITHUB_STEP_SUMMARY

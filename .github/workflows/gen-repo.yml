@@ -20,7 +20,7 @@ on:
         required: false
         default: "main,x11,root,glibc"
       clean_hf:
-        description: "DELETE EVERYTHING on Hugging Face before uploading"
+        description: "DELETE the entire HF repo and recreate it before uploading"
         type: boolean
         default: false
 
@@ -30,22 +30,26 @@ permissions:
 jobs:
   build-and-publish:
     runs-on: ubuntu-24.04
+    env:
+      HF_REPO: ${{ inputs.hf_repo_id }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      SRC: ${{ inputs.source_repo }}
+      CLEAN_HF: ${{ inputs.clean_hf }}
     steps:
-
-    # ================================================================
-    # PHASE 1 — PREPARATION (no network I/O to GitHub Releases or HF)
-    # ================================================================
 
     - name: Install tools
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq dpkg-dev apt-utils gzip zstd jq
-        pip install -q --upgrade "huggingface_hub[cli]<1.0"
+        sudo apt-get install -y -qq dpkg-dev apt-utils gzip zstd jq curl
+        pip install -q --upgrade "huggingface_hub<1.0"
+        python3 -c 'import huggingface_hub; print("huggingface_hub", huggingface_hub.__version__)'
 
+    # ==================================================================
+    # 1. Resolve tags (needs GITHUB_TOKEN, cannot run in later stages)
+    # ==================================================================
     - name: Resolve tags
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        SRC: ${{ inputs.source_repo }}
         INPUT_TAGS: ${{ inputs.tags }}
         INPUT_REPOS: ${{ inputs.repos }}
       run: |
@@ -65,8 +69,7 @@ jobs:
         fi
 
         if [ "${#TAGS[@]}" -eq 0 ]; then
-          echo "::error::No tags found"
-          exit 1
+          echo "::error::No tags found"; exit 1
         fi
 
         for tag in "${TAGS[@]}"; do
@@ -75,63 +78,56 @@ jobs:
             xodos-XoDos-x11-p*)   printf 'x11\t%s\n'   "$tag" >> /tmp/plan/groups.txt ;;
             xodos-XoDos-root-p*)  printf 'root\t%s\n'  "$tag" >> /tmp/plan/groups.txt ;;
             xodos-XoDos-glibc-p*) printf 'glibc\t%s\n' "$tag" >> /tmp/plan/groups.txt ;;
-            *) echo ">>> WARNING: unparsed tag: $tag" ;;
           esac
         done
 
         cut -f1 /tmp/plan/groups.txt | sort -u > /tmp/plan/repos.txt
-        echo ">>> Tags to process:"
+        echo ">>> Groups:"
         sort /tmp/plan/groups.txt | sed 's/^/    /'
 
-    - name: Validate plan
+    # ==================================================================
+    # 2. Clean Hugging Face (delete repo entirely and recreate)
+    # ==================================================================
+    - name: Clean Hugging Face repo
+      if: ${{ inputs.clean_hf }}
       run: |
         set -euo pipefail
-        echo ">>> plan validation"
-        [ -s /tmp/plan/repos.txt ] || { echo "::error::no repos resolved"; exit 1; }
-        [ -s /tmp/plan/groups.txt ] || { echo "::error::no tags grouped"; exit 1; }
-        echo ">>> repos:"
-        sed 's/^/    /' /tmp/plan/repos.txt
-        echo ">>> tag count per repo:"
-        for r in $(cat /tmp/plan/repos.txt); do
-          n=$(grep -Pc "^${r}\t" /tmp/plan/groups.txt || true)
-          echo "    $r: $n tag(s)"
-        done
+        python3 -c "
+        import os, sys
+        from huggingface_hub import HfApi
+        from huggingface_hub.utils import RepositoryNotFoundError
 
-    - name: Create HF dataset repo (idempotent)
-      env:
-        HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        HF_REPO: ${{ inputs.hf_repo_id }}
-      run: |
-        set -euo pipefail
-        huggingface-cli repo create "$HF_REPO" --repo-type dataset --exist-ok --token "$HF_TOKEN"
-        echo ">>> HF repo ready: https://huggingface.co/datasets/$HF_REPO"
+        api = HfApi()
+        repo = os.environ['HF_REPO']
+        token = os.environ['HF_TOKEN']
 
-    - name: Optionally clean Hugging Face (if clean_hf=true)
-      if: ${{ inputs.clean_hf == 'true' }}
-      env:
-        HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        HF_REPO: ${{ inputs.hf_repo_id }}
-      run: |
-        set -euo pipefail
-        echo "=================================================="
-        echo ">>> clean_hf=true — DELETING EVERYTHING on HF first"
-        echo "=================================================="
-        EMPTY=$(mktemp -d)
-        huggingface-cli upload "$HF_REPO" "$EMPTY" . \
-          --repo-type dataset \
-          --token "$HF_TOKEN" \
-          --delete "*" || true
-        rm -rf "$EMPTY"
-        echo ">>> HF repo wiped"
+        print('>>> attempt to delete:', repo)
+        try:
+            api.delete_repo(repo_id=repo, repo_type='dataset', token=token)
+            print('>>> deleted successfully')
+        except RepositoryNotFoundError:
+            print('>>> repo did not exist (nothing to delete)')
+        except Exception as e:
+            print('>>> WARN: delete failed:', type(e).__name__, e)
 
-    # ================================================================
-    # PHASE 2 — DOWNLOAD (heavy I/O #1, runs near the end)
-    # ================================================================
+        print('>>> re-creating empty repo:', repo)
+        api.create_repo(repo_id=repo, repo_type='dataset', exist_ok=True, token=token)
 
-    - name: "PHASE 2: Download .deb files from GitHub Releases"
+        files = list(api.list_repo_files(repo_id=repo, repo_type='dataset', token=token))
+        print('>>> files after recreate:', len(files))
+        if files:
+            for f in files[:20]:
+                print('    ', f)
+            if len(files) > 20:
+                print('    ... and', len(files)-20, 'more')
+        "
+
+    # ==================================================================
+    # 3. Download .deb files from GitHub Releases
+    # ==================================================================
+    - name: Download .deb from GitHub Releases
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        SRC: ${{ inputs.source_repo }}
       run: |
         set -euo pipefail
         rm -rf /tmp/raw-debs
@@ -153,17 +149,19 @@ jobs:
               find "$tmpdir" -maxdepth 1 -type f -name '*.deb' -print0 \
                 | xargs -0r mv -t "/tmp/raw-debs/$repo/"
             else
-              echo "    WARN: download failed for $tag"
+              echo "    WARN: failed to download $tag"
               head -3 /tmp/dl_err.log | sed 's/^/        /' || true
             fi
             rm -rf "$tmpdir"
           done < <(grep -P "^${repo}\t" /tmp/plan/groups.txt | cut -f2)
-
           total=$(find "/tmp/raw-debs/$repo" -maxdepth 1 -type f -name '*.deb' | wc -l)
           echo "    repo $repo total: $total"
         done < /tmp/plan/repos.txt
 
-    - name: Build full APT repository
+    # ==================================================================
+    # 4. Build the full APT repo tree (dists + pool) locally
+    # ==================================================================
+    - name: Build APT repository tree
       run: |
         set -euo pipefail
         BUILD=/tmp/aptrepo
@@ -181,7 +179,10 @@ jobs:
             *)     continue ;;
           esac
 
+          echo "=================================================="
           echo ">>> building: xodos-${repo}  (dist=$dist comp=$comp)"
+          echo "=================================================="
+
           outdir="$BUILD/xodos-${repo}"
           pooldir="$outdir/pool/${comp}"
           mkdir -p "$pooldir"
@@ -203,13 +204,13 @@ jobs:
           placed=0
           while IFS=$'\t' read -r pkg ver path; do
             [ -z "$pkg" ] && continue
-            fl=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
-            dest_dir="${pooldir}/${fl}/${pkg}"
+            first_letter=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
+            dest_dir="${pooldir}/${first_letter}/${pkg}"
             mkdir -p "$dest_dir"
             cp -a "$path" "$dest_dir/"
             placed=$((placed + 1))
           done < "$winners"
-          echo "    placed ${placed} unique packages"
+          echo ">>> placed ${placed} unique packages in pool"
 
           dists="$outdir/dists/${dist}/${comp}"
           mkdir -p "$dists/binary-aarch64" "$dists/binary-all"
@@ -245,80 +246,97 @@ jobs:
           cd - >/dev/null
         done < /tmp/plan/repos.txt
 
+        # Add README
+        cat > "$BUILD/README.md" <<'READMEEOF'
+        # xodos-packages
+
+        APT repository for xodos Termux packages.
+
+        ## sources.list
+
+        ```
+        deb [trusted=yes] https://huggingface.co/datasets/xodiosx/xodos-packages/resolve/main/xodos-main stable main
+        deb [trusted=yes] https://huggingface.co/datasets/xodiosx/xodos-packages/resolve/main/xodos-x11 x11 main
+        deb [trusted=yes] https://huggingface.co/datasets/xodiosx/xodos-packages/resolve/main/xodos-root root stable
+        deb [trusted=yes] https://huggingface.co/datasets/xodiosx/xodos-packages/resolve/main/xodos-glibc glibc main
+        ```
+        READMEEOF
+
         echo ""
-        echo ">>> total build size: $(du -sh "$BUILD" | awk '{print $1}')"
+        echo ">>> final tree:"
+        find "$BUILD" -maxdepth 3 -type d | sort | sed 's/^/    /'
+        echo ""
+        echo ">>> size: $(du -sh "$BUILD" | awk '{print $1}')"
 
-    - name: Stage for upload
+    # ==================================================================
+    # 5. Create HF repo if needed (in case clean_hf=false and it doesn't exist)
+    # ==================================================================
+    - name: Ensure HF repo exists
       run: |
         set -euo pipefail
-        STAGE=/tmp/hf-stage
-        rm -rf "$STAGE"
-        mkdir -p "$STAGE"
-        cp -a /tmp/aptrepo/. "$STAGE"/
+        python3 -c "
+        import os
+        from huggingface_hub import HfApi
+        api = HfApi()
+        api.create_repo(
+            repo_id=os.environ['HF_REPO'],
+            repo_type='dataset',
+            exist_ok=True,
+            token=os.environ['HF_TOKEN'],
+        )
+        print('>>> repo ready:', os.environ['HF_REPO'])
+        "
 
-        {
-          echo '# xodos-packages'
-          echo ''
-          echo 'APT repository for xodos Termux packages.'
-          echo ''
-          echo '## sources.list'
-          echo ''
-          echo '```'
-          echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-main stable main"
-          echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-x11 x11 main"
-          echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-root root stable"
-          echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-glibc glibc main"
-          echo '```'
-        } > "$STAGE/README.md"
-
-        echo ">>> staging size: $(du -sh "$STAGE" | awk '{print $1}')"
-
-    # ================================================================
-    # PHASE 3 — UPLOAD (heavy I/O #2, THE final step)
-    # ================================================================
-
-    - name: "PHASE 3: Upload everything to Hugging Face"
-      env:
-        HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        HF_REPO: ${{ inputs.hf_repo_id }}
+    # ==================================================================
+    # 6. Upload the whole tree to Hugging Face
+    # ==================================================================
+    - name: Upload to Hugging Face
       run: |
         set -euo pipefail
-        STAGE=/tmp/hf-stage
-        echo "=================================================="
-        echo ">>> uploading $(du -sh "$STAGE" | awk '{print $1}') to $HF_REPO"
-        echo "=================================================="
+        python3 -c "
+        import os
+        from huggingface_hub import HfApi
+        api = HfApi()
+        api.upload_folder(
+            folder_path='/tmp/aptrepo',
+            repo_id=os.environ['HF_REPO'],
+            repo_type='dataset',
+            token=os.environ['HF_TOKEN'],
+            commit_message='Update APT repository',
+        )
+        print('>>> upload complete')
+        "
 
-        huggingface-cli upload "$HF_REPO" "$STAGE" . \
-          --repo-type dataset \
-          --token "$HF_TOKEN"
-
-        echo ">>> upload complete"
-
-    # ================================================================
-    # PHASE 4 — VERIFY + SUMMARY
-    # ================================================================
-
-    - name: Verify live URLs
+    # ==================================================================
+    # 7. Verify a few files are live
+    # ==================================================================
+    - name: Verify
       run: |
-        echo ">>> checking a few files are live..."
+        set -euo pipefail
+        base="https://huggingface.co/datasets/${HF_REPO}/resolve/main"
+        ok=0; bad=0
         for f in \
           "xodos-main/dists/stable/Release" \
           "xodos-main/dists/stable/main/binary-aarch64/Packages.gz" \
           "xodos-x11/dists/x11/Release" \
+          "xodos-x11/dists/x11/main/binary-aarch64/Packages.gz" \
           "xodos-root/dists/root/Release" \
           "xodos-glibc/dists/glibc/Release"; do
-          url="https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/$f"
-          code=$(curl -s -o /dev/null -w "%{http_code}" "$url")
-          echo "  $code  $url"
+          code=$(curl -s -o /dev/null -w "%{http_code}" "$base/$f")
+          if [ "$code" = "200" ]; then
+            echo "  OK   $f"; ok=$((ok+1))
+          else
+            echo "  $code  $f"; bad=$((bad+1))
+          fi
         done
+        echo ">>> ok=$ok bad=$bad"
 
     - name: Summary
       run: |
         {
-          echo "## APT Repository published to Hugging Face"
+          echo "## APT Repository Published"
           echo ""
-          echo "- Source: \`${{ inputs.source_repo }}\`"
-          echo "- HF: https://huggingface.co/datasets/${{ inputs.hf_repo_id }}"
+          echo "- HF repo: https://huggingface.co/datasets/${{ inputs.hf_repo_id }}"
           echo "- clean_hf: \`${{ inputs.clean_hf }}\`"
           echo ""
           echo "### sources.list"

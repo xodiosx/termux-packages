@@ -19,7 +19,7 @@ on:
       repos:
         description: "Repos to process (comma-separated)"
         required: true
-        default: "main"
+        default: "main,x11,root,glibc,tur,tur-on-device,tur-continuous"
       source_repo:
         description: "GitHub repo with releases (used in full / pool-only)"
         required: false

@@ -27,11 +27,13 @@ jobs:
   build-and-publish:
     runs-on: ubuntu-24.04
     env:
-      # HF_TOKEN must be an env var (upload_large_folder doesn't accept token=)
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       HF_REPO: ${{ inputs.hf_repo_id }}
       SRC: ${{ github.repository }}
       CLEAN_HF: ${{ inputs.clean_hf }}
+      # Use a PAT for GitHub reads — installation token hits 1000/hr limit.
+      # Fall back to GITHUB_TOKEN if PAT is not set.
+      GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN || secrets.GITHUB_TOKEN }}
     steps:
 
     - name: Install tools
@@ -41,12 +43,20 @@ jobs:
         pip install -q --upgrade "huggingface_hub<1.0"
         python3 -c 'import huggingface_hub; print("huggingface_hub", huggingface_hub.__version__)'
 
+    - name: Check token type
+      run: |
+        set -euo pipefail
+        token_type=$(gh api rate_limit --jq '.resources.core.limit' 2>/dev/null || echo "unknown")
+        echo ">>> GitHub API rate limit: $token_type requests/hour"
+        if [ "$token_type" = "1000" ]; then
+          echo "::warning::Using GITHUB_TOKEN (1000/hr). Set SOURCE_REPO_TOKEN (PAT) for 5000/hr."
+        fi
+
     # ==================================================================
     # 1. Resolve tags
     # ==================================================================
     - name: Resolve tags
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         INPUT_TAGS: ${{ inputs.tags }}
         INPUT_REPOS: ${{ inputs.repos }}
       run: |
@@ -112,16 +122,39 @@ jobs:
         "
 
     # ==================================================================
-    # 3. Download .deb files from GitHub Releases
-    #    Handles both loose .deb files AND .tar.xz / .tar.gz / .zip
+    # 3. Download with retry + backoff + per-file delay
+    #    This is the fix for "API rate limit exceeded for installation"
     # ==================================================================
     - name: Download from GitHub Releases
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
         rm -rf /tmp/raw-debs
         mkdir -p /tmp/raw-debs
+
+        # Retry helper: tries up to 5 times with exponential backoff
+        # on 403 rate-limit errors, then gives up.
+        download_with_retry() {
+          local tag="$1" dest="$2"
+          local attempt=1
+          local max_attempts=5
+          while [ "$attempt" -le "$max_attempts" ]; do
+            if gh release download "$tag" --repo "$SRC" --dir "$dest" 2>/tmp/dl_err.log; then
+              return 0
+            fi
+            if grep -qiE 'rate limit|403|429|secondary' /tmp/dl_err.log; then
+              local backoff=$((attempt * 30))
+              echo "        rate limited (attempt $attempt/$max_attempts), sleeping ${backoff}s"
+              sleep "$backoff"
+            else
+              echo "        download error (attempt $attempt/$max_attempts):"
+              head -3 /tmp/dl_err.log | sed 's/^/            /'
+              local backoff=$((attempt * 5))
+              sleep "$backoff"
+            fi
+            attempt=$((attempt + 1))
+          done
+          return 1
+        }
 
         while IFS= read -r repo; do
           [ -z "$repo" ] && continue
@@ -135,14 +168,12 @@ jobs:
             echo ">>> tag: $tag"
 
             tmpdir=$(mktemp -d)
-            if ! gh release download "$tag" --repo "$SRC" --dir "$tmpdir" 2>/tmp/dl_err.log; then
-              echo "    FAIL: could not download $tag"
-              head -5 /tmp/dl_err.log | sed 's/^/        /' || true
+            if ! download_with_retry "$tag" "$tmpdir"; then
+              echo "    FAIL: gave up on $tag"
               rm -rf "$tmpdir"
               continue
             fi
 
-            # Show what's in the release
             count_all=$(find "$tmpdir" -maxdepth 1 -type f | wc -l)
             count_deb=$(find "$tmpdir" -maxdepth 1 -type f -name '*.deb' | wc -l)
             echo "    assets: $count_all total, $count_deb .deb"
@@ -154,13 +185,12 @@ jobs:
               echo "        ..."
             fi
 
-            # (a) Move loose .deb files
             if [ "$count_deb" -gt 0 ]; then
               find "$tmpdir" -maxdepth 1 -type f -name '*.deb' -print0 \
                 | xargs -0r mv -t "/tmp/raw-debs/$repo/"
             fi
 
-            # (b) Extract any archives
+            # Extract archives if any
             shopt -s nullglob
             for arc in "$tmpdir"/*.tar.xz "$tmpdir"/*.tar.gz "$tmpdir"/*.tgz "$tmpdir"/*.zip; do
               [ -f "$arc" ] || continue
@@ -182,6 +212,9 @@ jobs:
             shopt -u nullglob
 
             rm -rf "$tmpdir"
+
+            # Small delay between tags to avoid secondary rate limit
+            sleep 3
           done < <(grep -P "^${repo}\t" /tmp/plan/groups.txt | cut -f2)
 
           total=$(find "/tmp/raw-debs/$repo" -maxdepth 1 -type f -name '*.deb' | wc -l)
@@ -199,7 +232,7 @@ jobs:
         fi
 
     # ==================================================================
-    # 4. Build full APT tree (dists + pool)
+    # 4. Build full APT tree (same as before)
     # ==================================================================
     - name: Build APT repository tree
       run: |
@@ -304,8 +337,6 @@ jobs:
         EOF
 
         echo ""
-        echo ">>> build tree:"
-        find "$BUILD" -maxdepth 2 -type d | sort | sed 's/^/    /'
         echo ">>> total .deb: $(find "$BUILD" -type f -name '*.deb' | wc -l)"
         echo ">>> total size: $(du -sh "$BUILD" | awk '{print $1}')"
 
@@ -328,7 +359,7 @@ jobs:
         "
 
     # ==================================================================
-    # 6. Upload — upload_large_folder (env-var auth)
+    # 6. Upload to Hugging Face
     # ==================================================================
     - name: Upload to Hugging Face
       run: |

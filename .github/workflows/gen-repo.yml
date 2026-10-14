@@ -44,9 +44,6 @@ jobs:
         pip install -q --upgrade "huggingface_hub<1.0"
         python3 -c 'import huggingface_hub; print("huggingface_hub", huggingface_hub.__version__)'
 
-    # ==================================================================
-    # 1. Resolve tags
-    # ==================================================================
     - name: Resolve tags
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -85,9 +82,6 @@ jobs:
         echo ">>> Groups:"
         sort /tmp/plan/groups.txt | sed 's/^/    /'
 
-    # ==================================================================
-    # 2. Clean Hugging Face (delete + recreate, reliably)
-    # ==================================================================
     - name: Clean Hugging Face repo
       if: ${{ inputs.clean_hf }}
       run: |
@@ -108,13 +102,8 @@ jobs:
             print('>>> WARN: delete failed:', type(e).__name__, e)
         api.create_repo(repo_id=repo, repo_type='dataset', exist_ok=True, token=token)
         print('>>> recreated empty:', repo)
-        files = list(api.list_repo_files(repo_id=repo, repo_type='dataset', token=token))
-        print('>>> files after recreate:', len(files))
         "
 
-    # ==================================================================
-    # 3. Download .deb files from GitHub Releases
-    # ==================================================================
     - name: Download .deb from GitHub Releases
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -148,9 +137,6 @@ jobs:
           echo "    repo $repo total: $total"
         done < /tmp/plan/repos.txt
 
-    # ==================================================================
-    # 4. Build full APT tree (dists + pool) locally
-    # ==================================================================
     - name: Build APT repository tree
       run: |
         set -euo pipefail
@@ -259,9 +245,6 @@ jobs:
         echo ">>> size: $(du -sh "$BUILD" | awk '{print $1}')"
         echo ">>> total .deb files: $(find "$BUILD" -type f -name '*.deb' | wc -l)"
 
-    # ==================================================================
-    # 5. Ensure HF repo exists
-    # ==================================================================
     - name: Ensure HF repo exists
       run: |
         set -euo pipefail
@@ -279,33 +262,27 @@ jobs:
         "
 
     # ==================================================================
-    # 6. Upload the WHOLE tree with upload_large_folder
-    #
-    # This is the critical fix. upload_folder makes one commit and
-    # silently fails on multi-GB uploads. upload_large_folder splits
-    # into multiple commits, is resumable, and handles retries.
+    # Upload — FIXED: no token argument. HF_TOKEN env var is picked up
+    # automatically by upload_large_folder.
     # ==================================================================
     - name: Upload to Hugging Face (upload_large_folder)
       run: |
         set -euo pipefail
         python3 -c "
-        import os, sys
+        import os
         from huggingface_hub import HfApi
         api = HfApi()
         print('>>> starting upload_large_folder...')
+        print('>>> HF_TOKEN is set:', bool(os.environ.get('HF_TOKEN')))
         api.upload_large_folder(
             folder_path='/tmp/aptrepo',
             repo_id=os.environ['HF_REPO'],
             repo_type='dataset',
-            token=os.environ['HF_TOKEN'],
             num_workers=4,
         )
         print('>>> upload complete')
         "
 
-    # ==================================================================
-    # 7. Verify
-    # ==================================================================
     - name: Verify
       run: |
         set -euo pipefail
@@ -327,15 +304,15 @@ jobs:
         done
         echo ">>> ok=$ok bad=$bad"
         echo ""
-        echo ">>> total files on HF:"
+        echo ">>> files on HF:"
         python3 -c "
         import os
         from huggingface_hub import HfApi
         api = HfApi()
         files = list(api.list_repo_files(repo_id=os.environ['HF_REPO'], repo_type='dataset', token=os.environ['HF_TOKEN']))
-        print('    ', len(files), 'files')
+        print('    total:', len(files))
         deb = [f for f in files if f.endswith('.deb')]
-        print('    ', len(deb), '.deb files')
+        print('    .deb:', len(deb))
         for f in deb[:5]:
             print('      ', f)
         "

@@ -48,7 +48,6 @@ jobs:
       REPOS_IN: ${{ inputs.repos }}
       CLEAN_HF: ${{ inputs.clean_hf }}
       HF_HUB_DISABLE_TELEMETRY: "1"
-      # Force absolute path so `cd` never breaks relative lookups
       WORK_DIR: ${{ github.workspace }}/work
 
     steps:
@@ -58,6 +57,7 @@ jobs:
           sudo apt-get install -y -qq dpkg-dev apt-utils gzip jq
           pip install -q --upgrade "huggingface_hub>=1.29.0"
           python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)"
+          python3 -c "import hf_xet; print('hf_xet OK')" 2>/dev/null || echo ">>> hf_xet not installed"
 
       - name: Compute targets
         run: |
@@ -103,17 +103,16 @@ jobs:
           sort -u "$WORK_DIR/targets.txt" -o "$WORK_DIR/targets.txt"
           sort -u "$WORK_DIR/dist-comp.txt" -o "$WORK_DIR/dist-comp.txt"
           echo ">>> Mode: $MODE"
-          echo ">>> WORK_DIR: $WORK_DIR"
           echo ">>> Targets:"
           sed 's/^/    /' "$WORK_DIR/targets.txt"
-          echo ">>> Dist/comp pairs:"
+          echo ">>> Dist/comp:"
           sed 's/^/    /' "$WORK_DIR/dist-comp.txt"
 
       - name: Wipe Hugging Face repo
         if: ${{ inputs.mode == 'full' && inputs.clean_hf }}
         run: |
           set -euo pipefail
-          echo "::warning::clean_hf=true — DELETING entire HF repo before upload"
+          echo "::warning::clean_hf=true — DELETING entire HF repo"
           cat > /tmp/wipe.py << 'PYEOF'
           import os
           from huggingface_hub import HfApi
@@ -173,8 +172,7 @@ jobs:
           python3 /tmp/dl_hf.py
           n=$(find /tmp/hf-debs -type f -name '*.deb' | wc -l)
           echo ">>> downloaded .deb: $n"
-          [ "$n" -gt 0 ] || { echo "::error::no .deb from HF"; exit 1; }
-          du -sh /tmp/hf-debs
+          du -sh /tmp/hf-debs 2>/dev/null || true
 
       - name: Download .deb from GitHub Releases
         if: ${{ inputs.mode != 'metadata-only' }}
@@ -226,8 +224,7 @@ jobs:
             done
           done
           if [ ! -s "$WORK_DIR/tags-for-run.txt" ]; then
-            echo "::error::No matching tags for selected repos"
-            exit 1
+            echo "::error::No matching tags"; exit 1
           fi
           echo ">>> tags to download:"
           sed 's/^/    /' "$WORK_DIR/tags-for-run.txt"
@@ -250,8 +247,7 @@ jobs:
             sleep 2
           done < "$WORK_DIR/tags-for-run.txt"
           if [ -n "$failed" ]; then
-            echo "::error::Failed tags:$failed"
-            exit 1
+            echo "::error::Failed tags:$failed"; exit 1
           fi
           total=$(find /tmp/gh-debs -type f -name '*.deb' | wc -l)
           echo ">>> downloaded .deb: $total"
@@ -293,9 +289,6 @@ jobs:
           done < "$WORK_DIR/tags-for-run.txt"
           echo ">>> .deb staged: $(find "$POOL" -type f -name '*.deb' | wc -l)"
 
-      # ==================================================================
-      # Build dists — every path is absolute now.
-      # ==================================================================
       - name: Build dists metadata
         run: |
           set -euo pipefail
@@ -309,7 +302,9 @@ jobs:
           fi
           echo ">>> SRC_ROOT=$SRC_ROOT"
 
-          # --- Packages (per component) ---
+          : > "$WORK_DIR/targets-built.txt"
+          : > "$WORK_DIR/targets-missing.txt"
+
           while read -r target dist comp; do
             [ -z "$target" ] && continue
             pooldir="$SRC_ROOT/${target}/pool/${comp}"
@@ -361,7 +356,6 @@ jobs:
             rm -f "$outd/Packages.xz" "$tsv" "${tsv}.w"
           done < "$WORK_DIR/dist-comp.txt"
 
-          # --- Release files: use ABSOLUTE path to targets.txt ---
           cd "$BUILD"
           while read -r target; do
             [ -z "$target" ] && continue
@@ -393,41 +387,71 @@ jobs:
             done
           done < "$WORK_DIR/targets.txt"
 
-          # --- Sanity: every target MUST have Release + InRelease ---
-          fail=0
           while read -r target; do
             [ -z "$target" ] && continue
-            [ -d "$target/dists" ] || { echo "::error::$target has no dists/"; fail=$((fail+1)); continue; }
-            found_rel=$(find "$target/dists" -type f -name Release | wc -l)
-            found_inrel=$(find "$target/dists" -type f -name InRelease | wc -l)
-            echo ">>> $target: Release=$found_rel  InRelease=$found_inrel"
-            [ "$found_rel" -ge 1 ] || fail=$((fail+1))
-            [ "$found_inrel" -ge 1 ] || fail=$((fail+1))
+            if [ -d "$target/dists" ] && \
+               find "$target/dists" -type f -name Release | grep -q . && \
+               find "$target/dists" -type f -name InRelease | grep -q .; then
+              echo ">>> OK      $target"
+              echo "$target" >> "$WORK_DIR/targets-built.txt"
+            else
+              echo ">>> MISSING $target"
+              echo "$target" >> "$WORK_DIR/targets-missing.txt"
+            fi
           done < "$WORK_DIR/targets.txt"
-          if [ "$fail" -gt 0 ]; then
-            echo "::error::Missing Release/InRelease for $fail target(s) — refusing to upload incomplete metadata"
-            find "$BUILD" -type f | sort | sed 's/^/    /'
-            exit 1
-          fi
 
-          echo ">>> dists tree:"
-          find "$BUILD" -type f | sort | sed 's/^/    /'
+          echo ""
           echo ">>> dists size: $(du -sh "$BUILD" | awk '{print $1}')"
+          echo ">>> built:   $(wc -l < "$WORK_DIR/targets-built.txt")"
+          echo ">>> missing: $(wc -l < "$WORK_DIR/targets-missing.txt")"
 
+      # ==================================================================
+      # Upload — uses upload_folder for huggingface_hub>=1.x
+      #         (upload_large_folder was removed in 1.0)
+      # ==================================================================
       - name: Upload to Hugging Face
         run: |
           set -euo pipefail
           cat > /tmp/upload.py << 'PYEOF'
           import os, time
           from huggingface_hub import HfApi
+
           api = HfApi()
           repo = os.environ["HF_REPO"]
           token = os.environ["HF_TOKEN"]
           mode = os.environ["MODE"]
           work = os.environ["WORK_DIR"]
+
           api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True, token=token)
           print(">>> HF repo:", repo, "| mode:", mode)
-          targets = [l.strip() for l in open(work + "/targets.txt") if l.strip()]
+
+          built = [l.strip() for l in open(work + "/targets-built.txt") if l.strip()]
+          print(">>> built targets:", built)
+
+          # Version-tolerant upload helper.
+          # 1.x: upload_large_folder removed → use upload_folder (XET handles chunking)
+          # 0.x: upload_large_folder present → use it (no token param, uses env var)
+          def upload_folder_any(folder_path, path_in_repo, label):
+              if hasattr(api, "upload_large_folder"):
+                  print(f"    [{label}] HfApi.upload_large_folder")
+                  os.environ["HF_TOKEN"] = token
+                  api.upload_large_folder(
+                      folder_path=folder_path,
+                      repo_id=repo,
+                      repo_type="dataset",
+                      path_in_repo=path_in_repo,
+                      num_workers=4,
+                  )
+              else:
+                  print(f"    [{label}] HfApi.upload_folder")
+                  api.upload_folder(
+                      folder_path=folder_path,
+                      repo_id=repo,
+                      repo_type="dataset",
+                      path_in_repo=path_in_repo,
+                      token=token,
+                      commit_message=f"Upload {path_in_repo}",
+                  )
 
           def with_retry(fn, label):
               for attempt in range(1, 6):
@@ -445,23 +469,19 @@ jobs:
               raise SystemExit(f"::error::{label} failed after 5 attempts")
 
           if mode == "pool-only":
-              for t in targets:
+              for t in built:
                   local_pool = "/tmp/pool-tree/" + t + "/pool"
                   if not os.path.isdir(local_pool):
                       print(">>> skip pool", t)
                       continue
                   print(">>> uploading", t + "/pool/ ...")
-                  with_retry(lambda t=t, local_pool=local_pool: api.upload_large_folder(
-                      folder_path=local_pool,
-                      repo_id=repo,
-                      repo_type="dataset",
-                      path_in_repo=t + "/pool",
-                      num_workers=4,
+                  with_retry(lambda t=t, local_pool=local_pool: upload_folder_any(
+                      local_pool, t + "/pool", f"pool {t}"
                   ), f"pool upload {t}")
                   print(">>> uploaded", t + "/pool/")
               raise SystemExit(0)
 
-          for t in targets:
+          for t in built:
               try:
                   api.delete_files(repo_id=repo, repo_type="dataset",
                                    delete_patterns=[t + "/dists/**"], token=token)
@@ -470,43 +490,31 @@ jobs:
                   print(">>> WARN clear", t, type(e).__name__, e)
 
           if mode == "full":
-              for t in targets:
+              for t in built:
                   local_pool = "/tmp/pool-tree/" + t + "/pool"
                   if not os.path.isdir(local_pool):
                       print(">>> skip pool", t)
                       continue
                   print(">>> uploading", t + "/pool/ ...")
-                  with_retry(lambda t=t, local_pool=local_pool: api.upload_large_folder(
-                      folder_path=local_pool,
-                      repo_id=repo,
-                      repo_type="dataset",
-                      path_in_repo=t + "/pool",
-                      num_workers=4,
+                  with_retry(lambda t=t, local_pool=local_pool: upload_folder_any(
+                      local_pool, t + "/pool", f"pool {t}"
                   ), f"pool upload {t}")
                   print(">>> uploaded", t + "/pool/")
 
-          for t in targets:
+          for t in built:
               local_dists = "/tmp/aptrepo/" + t + "/dists"
               if not os.path.isdir(local_dists):
                   print(">>> skip dists", t)
                   continue
               print(">>> uploading", t + "/dists/ ...")
-              with_retry(lambda t=t, local_dists=local_dists: api.upload_folder(
-                  folder_path=local_dists,
-                  path_in_repo=t + "/dists",
-                  repo_id=repo,
-                  repo_type="dataset",
-                  token=token,
-                  commit_message="Regenerate " + t + " APT metadata",
+              with_retry(lambda t=t, local_dists=local_dists: upload_folder_any(
+                  local_dists, t + "/dists", f"dists {t}"
               ), f"dists upload {t}")
               print(">>> uploaded", t + "/dists/")
           print(">>> done")
           PYEOF
           python3 /tmp/upload.py
 
-      # ==================================================================
-      # Verify — follow redirects (HF uses 302 for resolve/main/*)
-      # ==================================================================
       - name: Verify URLs
         run: |
           set -euo pipefail
@@ -514,9 +522,12 @@ jobs:
           fail=0
           while read -r target dist comp; do
             [ -z "$target" ] && continue
+            if ! grep -qx "$target" "$WORK_DIR/targets-built.txt"; then
+              echo "  SKIP  $target (not built this run)"
+              continue
+            fi
             for f in "Release" "InRelease" "${comp}/binary-aarch64/Packages.gz"; do
               url="${base}/${target}/dists/${dist}/${f}?t=$(date +%s)"
-              # -L follows the 302 to the CDN
               code=$(curl -sL -o /dev/null -w "%{http_code}" "$url")
               printf '  %s  %s\n' "$code" "${target}/dists/${dist}/${f}"
               [ "$code" = "200" ] || fail=$((fail+1))
@@ -528,6 +539,21 @@ jobs:
           fi
           echo ">>> all URLs OK"
 
+      - name: Report missing targets
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -s "$WORK_DIR/targets-missing.txt" ]; then
+            echo ">>> all selected targets built successfully"
+            exit 0
+          fi
+          echo "::error::The following targets had no pool data:"
+          while read -r t; do
+            [ -z "$t" ] && continue
+            echo "::error::    $t"
+          done < "$WORK_DIR/targets-missing.txt"
+          exit 1
+
       - name: Summary
         run: |
           {
@@ -537,4 +563,16 @@ jobs:
             echo "**Repos:** \`${{ inputs.repos }}\`"
             echo "**clean_hf:** \`${{ inputs.clean_hf }}\`"
             echo "**huggingface_hub:** $(python3 -c 'import huggingface_hub; print(huggingface_hub.__version__)')"
+            echo ""
+            echo "### Targets built this run"
+            echo '```'
+            cat "$WORK_DIR/targets-built.txt" 2>/dev/null || echo "(none)"
+            echo '```'
+            if [ -s "$WORK_DIR/targets-missing.txt" ]; then
+              echo ""
+              echo "### Targets with no pool data (not built)"
+              echo '```'
+              cat "$WORK_DIR/targets-missing.txt"
+              echo '```'
+            fi
           } >> $GITHUB_STEP_SUMMARY

@@ -56,21 +56,49 @@ jobs:
       max-parallel: 2
       matrix:
         include:
-          - { name: main,           url: "https://packages-cf.termux.dev/apt/termux-main/pool/main/",   release_prefix: XoDos-main  }
-          - { name: x11,            url: "https://packages-cf.termux.dev/apt/termux-x11/pool/main/",    release_prefix: XoDos-x11   }
-          - { name: root,           url: "https://packages-cf.termux.dev/apt/termux-root/pool/stable/", release_prefix: XoDos-root  }
-          # TUR uses Debian-style layout: base = tur.kcubeterm.com, component = tur/tur-on-device/tur-continuous
-          # Verified layout (run `curl -sI <url>` first if unsure):
-          - { name: tur,            url: "https://tur.kcubeterm.com/pool/tur/",             release_prefix: XoDos-tur            }
-          - { name: tur-on-device,  url: "https://tur.kcubeterm.com/pool/tur-on-device/",   release_prefix: XoDos-tur-on-device  }
-          - { name: tur-continuous, url: "https://tur.kcubeterm.com/pool/tur-continuous/",  release_prefix: XoDos-tur-continuous }
-          # To add glibc, provide a working pool URL (Termux CDN does not host one):
-          # - { name: glibc,        url: "https://<your-glibc-mirror>/pool/stable/",        release_prefix: XoDos-glibc         }
+          # Termux official repos: classic Debian pool layout
+          - name: main
+            packages_url: "https://packages-cf.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages"
+            base_url:     "https://packages-cf.termux.dev/apt/termux-main/"
+            release_prefix: XoDos-main
+
+          - name: x11
+            packages_url: "https://packages-cf.termux.dev/apt/termux-x11/dists/x11/main/binary-aarch64/Packages"
+            base_url:     "https://packages-cf.termux.dev/apt/termux-x11/"
+            release_prefix: XoDos-x11
+
+          - name: root
+            packages_url: "https://packages-cf.termux.dev/apt/termux-root/dists/root/stable/binary-aarch64/Packages"
+            base_url:     "https://packages-cf.termux.dev/apt/termux-root/"
+            release_prefix: XoDos-root
+
+          # TUR: metadata on tur.kcubeterm.com, .deb on GitHub Releases (absolute Filename: URLs)
+          - name: tur
+            packages_url: "https://tur.kcubeterm.com/dists/tur-packages/tur/binary-aarch64/Packages"
+            base_url:     "https://tur.kcubeterm.com/"
+            release_prefix: XoDos-tur
+
+          - name: tur-on-device
+            packages_url: "https://tur.kcubeterm.com/dists/tur-packages/tur-on-device/binary-aarch64/Packages"
+            base_url:     "https://tur.kcubeterm.com/"
+            release_prefix: XoDos-tur-on-device
+
+          - name: tur-continuous
+            packages_url: "https://tur.kcubeterm.com/dists/tur-packages/tur-continuous/binary-aarch64/Packages"
+            base_url:     "https://tur.kcubeterm.com/"
+            release_prefix: XoDos-tur-continuous
+
+          # Optional: glibc if you host your own mirror later
+          # - name: glibc
+          #   packages_url: "https://<host>/dists/glibc/main/binary-aarch64/Packages"
+          #   base_url:     "https://<host>/"
+          #   release_prefix: XoDos-glibc
 
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
-      SRC_URL: ${{ matrix.url }}
+      PACKAGES_URL: ${{ matrix.packages_url }}
+      BASE_URL: ${{ matrix.base_url }}
       REL_PREFIX: ${{ matrix.release_prefix }}
       REPO_NAME: ${{ matrix.name }}
       TAG_PREFIX: ${{ inputs.tag_prefix }}
@@ -102,14 +130,14 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq binutils xz-utils zstd dpkg-dev perl curl ca-certificates
 
-      - name: Verify pool URL is reachable
+      - name: Verify Packages URL
         if: steps.skipcheck.outputs.skip == 'false'
         run: |
           set -euo pipefail
-          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "${SRC_URL}" || echo "000")
-          echo ">>> ${SRC_URL} -> HTTP ${code}"
+          code=$(curl -sL -o /dev/null -w "%{http_code}" --max-time 20 "$PACKAGES_URL" || echo "000")
+          echo ">>> ${PACKAGES_URL} -> HTTP ${code}"
           if [ "$code" != "200" ]; then
-            echo "::error::Pool URL returned HTTP ${code} — check the matrix entry for '$REPO_NAME'"
+            echo "::error::Packages URL returned HTTP ${code} for '$REPO_NAME'"
             exit 1
           fi
 
@@ -118,86 +146,60 @@ jobs:
         run: df -h /
 
       # ==========================================================
-      # STAGE 1 — CRAWL + ARCH FILTER
+      # STAGE 1 — fetch Packages file, extract .deb URLs
       # ==========================================================
-      - name: Crawl pool for .deb URLs
+      - name: Extract .deb URLs from Packages
         if: steps.skipcheck.outputs.skip == 'false'
         run: |
           set -euo pipefail
           mkdir -p work
-          BASE="${SRC_URL%/}/"
 
-          cat > /tmp/crawl_one.sh <<'EOS'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          BASE="$1"; sub="${2%/}"; url="${BASE}${sub}/"
-          body="$(curl -fsSL --max-time 30 --retry 3 --retry-delay 1 "$url" 2>/dev/null)" || exit 0
-          [ -z "$body" ] && exit 0
-          printf '%s' "$body" \
-            | sed -E 's/href="([^"]+)"/\n\1\n/g' \
-            | tr -s '[:space:]' '\n' \
-            | grep -E '(.*/|.*\.deb)$' \
-            | grep -vE '^(\.\./|\./|/)$' \
-            | grep -vE '[<>"?]' \
-            | sort -u \
-            | while IFS= read -r e; do printf '%s/%s\n' "$sub" "$e"; done
-          EOS
-          chmod +x /tmp/crawl_one.sh
+          echo ">>> fetching $PACKAGES_URL"
+          curl -fsSL --retry 4 --retry-delay 2 --max-time 120 \
+            -o work/Packages "$PACKAGES_URL" \
+            || { echo "::error::cannot fetch Packages file"; exit 1; }
 
-          extract_body() {
-            sed -E 's/href="([^"]+)"/\n\1\n/g' \
-              | tr -s '[:space:]' '\n' \
-              | grep -E '(.*/|.*\.deb)$' \
-              | grep -vE '^(\.\./|\./|/)$' \
-              | grep -vE '[<>"?]' \
-              | sort -u
-          }
+          size=$(wc -c < work/Packages)
+          echo ">>> Packages size: ${size} bytes"
 
-          echo ">>> BASE=$BASE"
-          curl -fsSL --max-time 30 "$BASE" > work/base.raw 2>/dev/null \
-            || { echo "::error::cannot fetch $BASE"; exit 1; }
+          # Extract Filename: entries, one per line
+          # Termux: relative paths like "pool/main/a/apt/apt_2.8.1-2_aarch64.deb"
+          # TUR:    absolute URLs like "https://github.com/.../file.deb"
+          grep -E '^Filename:' work/Packages \
+            | sed 's/^Filename:[[:space:]]*//' \
+            | sed 's/[[:space:]]*$//' \
+            > work/filenames-raw.txt
 
-          extract_body < work/base.raw > work/base.entries || true
-          grep -E '\.deb$' work/base.entries | sort -u > work/flat_debs.txt || true
-          grep -E '/$'    work/base.entries | sort -u > work/L1.txt       || true
+          raw_total=$(wc -l < work/filenames-raw.txt)
+          echo ">>> total Filename entries: $raw_total"
 
-          echo ">>> flat debs at base: $(wc -l < work/flat_debs.txt)"
-          echo ">>> L1 dirs:          $(wc -l < work/L1.txt)"
-
-          : > work/L1.out
-          if [ -s work/L1.txt ]; then
-            echo ">>> crawling L1 ($(wc -l < work/L1.txt) dirs, parallel 24)…"
-            xargs -a work/L1.txt -P 24 -I{} bash /tmp/crawl_one.sh "$BASE" {} \
-              > work/L1.out 2>/dev/null || true
-          fi
-          grep -E '\.deb$' work/L1.out | sort -u > work/L1_debs.txt || true
-          grep -E '/$'    work/L1.out | sort -u > work/L2.txt       || true
-          echo ">>> L1 debs: $(wc -l < work/L1_debs.txt)  |  L2 dirs: $(wc -l < work/L2.txt)"
-
-          : > work/L2.out
-          if [ -s work/L2.txt ]; then
-            echo ">>> crawling L2 ($(wc -l < work/L2.txt) dirs, parallel 32)…"
-            xargs -a work/L2.txt -P 32 -I{} bash /tmp/crawl_one.sh "$BASE" {} \
-              > work/L2.out 2>/dev/null || true
-          fi
-          grep -E '\.deb$' work/L2.out | sort -u > work/L2_debs.txt || true
-          echo ">>> L2 debs: $(wc -l < work/L2_debs.txt)"
-
-          cat work/flat_debs.txt work/L1_debs.txt work/L2_debs.txt 2>/dev/null \
-            | sort -u > work/deblist-all.txt || true
-          all_total=$(wc -l < work/deblist-all.txt | tr -d ' ')
-          echo ">>> TOTAL .deb URLs discovered: $all_total"
-
-          if [ "$all_total" -eq 0 ]; then
-            echo "::error::No .deb URLs found at $BASE"
-            head -30 work/base.raw || true
+          if [ "$raw_total" -eq 0 ]; then
+            echo "::error::No Filename entries in Packages"
+            head -30 work/Packages || true
             exit 1
           fi
+
+          # Convert to absolute URLs where needed.
+          # - entries starting with "http" are left as-is (TUR)
+          # - relative entries are prepended with BASE_URL
+          : > work/urls-all.txt
+          while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            case "$entry" in
+              http://*|https://*) printf '%s\n' "$entry" >> work/urls-all.txt ;;
+              /*) printf '%s%s\n' "${BASE_URL%/}" "$entry" >> work/urls-all.txt ;;
+              *)  printf '%s/%s\n' "${BASE_URL%/}" "$entry" >> work/urls-all.txt ;;
+            esac
+          done < work/filenames-raw.txt
+
+          sort -u work/urls-all.txt > work/urls-all-sorted.txt
+          all_total=$(wc -l < work/urls-all-sorted.txt)
+          echo ">>> unique URLs: $all_total"
 
           # ---------------- ARCH FILTER ----------------
           if [ -z "${ARCH_IN// /}" ]; then
             echo ">>> arch filter: none (all archs)"
-            cp work/deblist-all.txt work/deblist.txt
+            cp work/urls-all-sorted.txt work/urls-filtered.txt
           else
             echo ">>> arch filter: [$ARCH_IN]"
             alt=""
@@ -207,35 +209,36 @@ jobs:
               if [ -z "$alt" ]; then alt="$a"; else alt="$alt|$a"; fi
             done
             [ "$need_all" = "1" ] && alt="$alt|all"
-            grep -E "_(${alt})\.deb$" work/deblist-all.txt > work/deblist.txt || true
+            grep -E "_(${alt})\.deb$" work/urls-all-sorted.txt > work/urls-filtered.txt || true
           fi
 
-          arch_total=$(wc -l < work/deblist.txt | tr -d ' ')
-          echo ">>> after arch filter: $arch_total / $all_total"
+          filt_total=$(wc -l < work/urls-filtered.txt)
+          echo ">>> after arch filter: $filt_total / $all_total"
 
-          if [ "$arch_total" -eq 0 ]; then
+          if [ "$filt_total" -eq 0 ]; then
             echo "::error::Arch filter [${ARCH_IN}] removed all debs"
             echo ">>> sample of discovered names:"
-            head -10 work/deblist-all.txt
+            head -10 work/urls-all-sorted.txt
             exit 1
           fi
 
           if [ "$MAX_DEBS" != "0" ] && [ -n "$MAX_DEBS" ]; then
-            head -n "$MAX_DEBS" work/deblist.txt > work/deblist-ltd.txt
-            mv work/deblist-ltd.txt work/deblist.txt
+            head -n "$MAX_DEBS" work/urls-filtered.txt > work/urls.txt
             echo ">>> limited to first $MAX_DEBS"
+          else
+            cp work/urls-filtered.txt work/urls.txt
           fi
 
-          echo ">>> first 5 URLs:"; head -5 work/deblist.txt
+          echo ">>> first 5 URLs:"
+          head -5 work/urls.txt
 
       # ==========================================================
-      # STAGE 2 — DOWNLOAD + PATCH (permissive, with fallbacks)
+      # STAGE 2 — DOWNLOAD + PATCH
       # ==========================================================
       - name: Download + patch
         if: steps.skipcheck.outputs.skip == 'false'
         run: |
           set -euo pipefail
-          BASE="${SRC_URL%/}/"
           mkdir -p work/patched work/tmp
           : > work/failures.log
           : > work/outcomes.log
@@ -266,14 +269,13 @@ jobs:
             rm -f "$dst"
           fi
 
-          err=""
-          if ! err="$(dpkg-deb -R "$src" "$tmp" 2>&1)"; then
+          if ! dpkg-deb -R "$src" "$tmp" 2>/dev/null; then
             cp -a "$src" "$dst"
             echo "FAIL-EXTRACT"
             exit 0
           fi
 
-          # 1) Rename the top-level data directory
+          # 1) Rename top-level data dir
           [ -d "$tmp/data/data/com.termux" ] && \
             mv "$tmp/data/data/com.termux" "$tmp/data/data/app.xodos2"
 
@@ -285,10 +287,7 @@ jobs:
             esac
           done < <(find "$tmp" -type l -print0 2>/dev/null || true)
 
-          # 3) Byte-level string replacement.
-          #    - Skip already-compressed blobs (their CRC32 would break).
-          #    - Only touch files that actually contain the pattern.
-          #    - Both strings are 10 bytes, so ELF offsets stay valid.
+          # 3) Byte-level replacement (skip compressed; skip files without pattern)
           while IFS= read -r -d '' f; do
             case "$f" in
               *.gz|*.xz|*.zst|*.bz2|*.lz4|*.lzma|*.zip|*.jar|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico) continue ;;
@@ -324,7 +323,7 @@ jobs:
             mv "$tmp/DEBIAN/conffiles.new" "$tmp/DEBIAN/conffiles"
           fi
 
-          # 6) Ensure u+rwx on data dirs so dpkg-deb --root-owner-group can read
+          # 6) Ensure u+rwx on data dirs
           find "$tmp/data" -type d -print0 2>/dev/null \
             | while IFS= read -r -d '' d; do
                 cur="$(stat -c '%a' "$d" 2>/dev/null || echo 755)"
@@ -333,31 +332,16 @@ jobs:
                 fi
               done
 
-          # 7) Try several pack strategies
-          if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then
-            echo "OK"
-            exit 0
-          fi
+          # 7) Pack with fallbacks
+          if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then echo "OK"; exit 0; fi
           rm -f "$dst"
-
-          if dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$dst" >/dev/null 2>&1; then
-            echo "OK-FALLBACK-GZIP"
-            exit 0
-          fi
+          if dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$dst" >/dev/null 2>&1; then echo "OK-FALLBACK-GZIP"; exit 0; fi
           rm -f "$dst"
-
-          if dpkg-deb -b "$tmp" "$dst" >/dev/null 2>&1; then
-            echo "OK-FALLBACK-NOROG"
-            exit 0
-          fi
+          if dpkg-deb -b "$tmp" "$dst" >/dev/null 2>&1; then echo "OK-FALLBACK-NOROG"; exit 0; fi
           rm -f "$dst"
-
           if [ -f "$tmp/DEBIAN/conffiles" ]; then
             : > "$tmp/DEBIAN/conffiles"
-            if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then
-              echo "OK-FALLBACK-NOCONFFILES"
-              exit 0
-            fi
+            if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then echo "OK-FALLBACK-NOCONFFILES"; exit 0; fi
             rm -f "$dst"
           fi
 
@@ -370,10 +354,11 @@ jobs:
           cat > /tmp/dl_and_patch.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
-          rel="$1"; BASE="$2"; outdir="$3"; tmpdir="$4"
-          faillog="$5"; outcomelog="$6"
+          url="$1"; outdir="$2"; tmpdir="$3"
+          faillog="$4"; outcomelog="$5"
 
-          enc="$(basename "$rel")"
+          # Filename = last path component (may contain url-encoded chars)
+          enc="$(basename "$url")"
           fn="$(printf '%s' "$enc" | perl -pe 's/%([0-9A-Fa-f]{2})/chr(hex($1))/ge')"
 
           tmpfile="$tmpdir/$fn"
@@ -381,8 +366,8 @@ jobs:
 
           [ -s "$outfile" ] && exit 0
 
-          curl -fsSL --retry 4 --retry-delay 2 --max-time 300 \
-            -o "$tmpfile" "${BASE}${rel}" 2>/dev/null \
+          curl -fsSL --retry 4 --retry-delay 2 --max-time 600 \
+            -o "$tmpfile" "$url" 2>/dev/null \
             || { rm -f "$tmpfile"; echo "DL-FAIL $fn" >> "$faillog"; exit 0; }
 
           outcome="$(/tmp/patch_one.sh "$tmpfile" "$outfile" 2>/dev/null | tail -1 || echo "FAIL-UNKNOWN")"
@@ -398,12 +383,12 @@ jobs:
           EOS
           chmod +x /tmp/dl_and_patch.sh
 
-          total=$(wc -l < work/deblist.txt | tr -d ' ')
+          total=$(wc -l < work/urls.txt | tr -d ' ')
           echo ">>> download+patch: $total debs, $WORKERS parallel"
           echo ">>> free space before: $(df -h --output=avail / | tail -1)"
 
-          xargs -a work/deblist.txt -P "$WORKERS" -I{} \
-            bash /tmp/dl_and_patch.sh {} "$BASE" "work/patched" "work/tmp" \
+          xargs -a work/urls.txt -P "$WORKERS" -I{} \
+            bash /tmp/dl_and_patch.sh {} "work/patched" "work/tmp" \
               "work/failures.log" "work/outcomes.log" \
             || true
 
@@ -502,11 +487,12 @@ jobs:
             cat > /tmp/notes.md <<EOF
           Patched Termux \`.deb\` packages for **${REPO_NAME}**.
 
-          - Source pool: \`${SRC_URL}\`
+          - Packages index: \`${PACKAGES_URL}\`
+          - Base URL: \`${BASE_URL}\`
           - Architecture filter: \`${ARCH_LABEL}\`
           - Prefix patch: \`/data/data/com.termux\` → \`/data/data/app.xodos2\`
-            (tree, symlink targets, and file contents via binary-safe
-            \`perl -0777\`; both strings are 10 bytes so ELF offsets are preserved;
+            (tree, symlink targets, binary-safe file-content \`perl -0777\`;
+            both strings are 10 bytes so ELF offsets stay valid;
             compressed blobs are skipped to avoid CRC corruption)
           - Maintainer script permissions restored to 0755
           - Non-existent conffiles entries filtered
@@ -593,7 +579,8 @@ jobs:
           {
             echo "### $REPO_NAME"
             echo ""
-            echo "- Source: \`$SRC_URL\`"
+            echo "- Packages: \`$PACKAGES_URL\`"
+            echo "- Base: \`$BASE_URL\`"
             echo "- Arch filter: \`${{ inputs.arch }}\`"
             echo "- Produced debs: **${{ steps.chunks.outputs.total }}**"
             echo "- Releases created: **${{ steps.chunks.outputs.chunks }}**"

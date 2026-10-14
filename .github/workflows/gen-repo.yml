@@ -35,6 +35,9 @@ jobs:
         pip install -q --upgrade "huggingface_hub<1.0"
         python3 -c 'import huggingface_hub; print("huggingface_hub", huggingface_hub.__version__)'
 
+    - name: Check disk space
+      run: df -h / /tmp 2>/dev/null || true
+
     # ==================================================================
     # 1. Resolve tags + group by repo
     # ==================================================================
@@ -87,9 +90,9 @@ jobs:
         sort /tmp/plan/groups.txt | sed 's/^/    /'
 
     # ==================================================================
-    # 2. Download .deb from GitHub (metadata only)
+    # 2. Download .deb from GitHub (kept, will be uploaded to HF pool)
     # ==================================================================
-    - name: Download .deb from GitHub (metadata only)
+    - name: Download .deb from GitHub
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         SRC: ${{ inputs.source_repo }}
@@ -121,10 +124,17 @@ jobs:
           echo ">>> repo $repo: $total .deb total"
         done < /tmp/plan/repos.txt
 
+        echo ""
+        echo ">>> raw-debs size: $(du -sh /tmp/raw-debs | awk '{print $1}')"
+
     # ==================================================================
-    # 3. Build Packages files
+    # 3. Build local tree:
+    #      /tmp/aptrepo/<target>/dists/...  (metadata)
+    #      /tmp/aptrepo/<target>/pool/<comp>/<letter>/<pkg>/<file>.deb
+    #    Filename in Packages uses the relative pool path.
+    #    Uses mv to save disk (raw-debs shrinks as we go).
     # ==================================================================
-    - name: Build Packages files
+    - name: Build local APT tree (dists + pool)
       run: |
         set -euo pipefail
         BUILD=/tmp/aptrepo
@@ -147,9 +157,11 @@ jobs:
           echo ">>> building $target/dists/$dist/$comp  (source repo: $repo)"
 
           outd="$BUILD/$target/dists/$dist/$comp/binary-aarch64"
-          mkdir -p "$outd"
+          pooldir="$BUILD/$target/pool/$comp"
+          mkdir -p "$outd" "$pooldir"
           : > "$outd/Packages"
 
+          # --- Pass 1: build TSV of all .deb ---
           tsv="/tmp/all-${repo}.tsv"
           : > "$tsv"
           shopt -s nullglob
@@ -168,20 +180,33 @@ jobs:
             continue
           fi
 
+          # --- Dedup: keep highest version of each package ---
           sort -t$'\t' -k1,1 -k2,2rV "$tsv" | awk -F'\t' '!seen[$1]++' > "/tmp/winners-${repo}.tsv"
 
+          # --- Pass 2: move .deb into pool + emit Packages entry ---
           placed=0
           while IFS=$'\t' read -r pkg ver path; do
             [ -z "$pkg" ] && continue
-            fname=$(basename "$path")
-            size=$(stat -c %s "$path")
-            md5=$(md5sum "$path" | awk '{print $1}')
-            sha1=$(sha1sum "$path" | awk '{print $1}')
-            sha256=$(sha256sum "$path" | awk '{print $1}')
 
-            dpkg-deb -f "$path" >> "$outd/Packages"
+            fname=$(basename "$path")
+            first_letter=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
+            rel_path="pool/${comp}/${first_letter}/${pkg}/${fname}"
+            dest_dir="$pooldir/${first_letter}/${pkg}"
+            mkdir -p "$dest_dir"
+
+            # Move the .deb into pool (frees disk in /tmp/raw-debs)
+            mv "$path" "$dest_dir/"
+
+            # Hashes computed on the pool copy
+            new_path="$dest_dir/$fname"
+            size=$(stat -c %s "$new_path")
+            md5=$(md5sum "$new_path" | awk '{print $1}')
+            sha1=$(sha1sum "$new_path" | awk '{print $1}')
+            sha256=$(sha256sum "$new_path" | awk '{print $1}')
+
+            dpkg-deb -f "$new_path" >> "$outd/Packages"
             {
-              echo "Filename: ${fname}"
+              echo "Filename: ${rel_path}"
               echo "Size: ${size}"
               echo "MD5sum: ${md5}"
               echo "SHA1: ${sha1}"
@@ -194,7 +219,14 @@ jobs:
           echo "    entries: $placed"
           gzip -kf -9 "$outd/Packages"
           rm -f "$outd/Packages.xz"
+
+          # Drop the leftover TSVs for this repo
+          rm -f "$tsv" "/tmp/winners-${repo}.tsv"
         done < /tmp/plan/repos.txt
+
+        echo ""
+        echo ">>> raw-debs remaining: $(du -sh /tmp/raw-debs 2>/dev/null | awk '{print $1}')"
+        echo ">>> aptrepo size: $(du -sh "$BUILD" | awk '{print $1}')"
 
     # ==================================================================
     # 4. Generate Release files
@@ -244,14 +276,16 @@ jobs:
         done
 
         echo ""
-        echo ">>> final tree:"
-        find "$BUILD" -type f | sort | sed 's/^/    /'
+        echo ">>> final tree (top 2 levels):"
+        find "$BUILD" -maxdepth 3 -type d | sort | sed 's/^/    /'
         echo ""
         echo ">>> total size: $(du -sh "$BUILD" | awk '{print $1}')"
+        echo ">>> total .deb: $(find "$BUILD" -type f -name '*.deb' | wc -l)"
 
     # ==================================================================
     # 5. Upload to Hugging Face
-    #    Inline python3 -c to avoid heredoc indentation issues.
+    #    - Delete ONLY stale dists/ (pool is preserved)
+    #    - Upload everything with upload_large_folder
     # ==================================================================
     - name: Upload to Hugging Face
       env:
@@ -260,32 +294,60 @@ jobs:
       run: |
         set -euo pipefail
         python3 -c "
-        import os, sys
+        import os
         from huggingface_hub import HfApi
+
         api = HfApi()
         repo = os.environ['HF_REPO']
-        token = os.environ['HF_TOKEN']
-        api.create_repo(repo_id=repo, repo_type='dataset', exist_ok=True, token=token)
+
+        api.create_repo(repo_id=repo, repo_type='dataset', exist_ok=True)
         print('>>> HF repo ready:', repo)
+
+        # --- 1. Delete ONLY stale dists under each target ---
         targets = ['xodos-main', 'xodos-x11', 'xodos-root', 'xodos-glibc', 'xodos-tur']
         for t in targets:
-            local = '/tmp/aptrepo/' + t
-            if not os.path.isdir(local):
-                print('>>> skip ' + t + ' (not built this run)')
-                continue
-            print('>>> uploading ' + t + '/ ...')
-            api.upload_folder(
-                folder_path=local,
-                path_in_repo=t,
-                repo_id=repo,
-                repo_type='dataset',
-                token=token,
-                commit_message='Update ' + t + ' APT metadata',
-                delete_patterns=['*'],
-            )
-            print('>>> ' + t + '/ uploaded')
-        print('>>> all done')
+            try:
+                api.delete_files(
+                    repo_id=repo,
+                    repo_type='dataset',
+                    delete_patterns=[t + '/dists/**'],
+                )
+                print('>>> cleared stale', t + '/dists/**')
+            except Exception as e:
+                print('>>> skip clear for', t, ':', type(e).__name__, e)
+
+        # --- 2. Upload whole /tmp/aptrepo (dists + pool) ---
+        # upload_large_folder hashes files and skips unchanged ones,
+        # so only new/modified files are actually transferred.
+        print('>>> uploading /tmp/aptrepo ...')
+        api.upload_large_folder(
+            folder_path='/tmp/aptrepo',
+            repo_id=repo,
+            repo_type='dataset',
+            num_workers=4,
+        )
+        print('>>> upload complete')
         "
+
+    - name: Verify live URLs
+      env:
+        HF_REPO: ${{ inputs.hf_repo_id }}
+      run: |
+        set -euo pipefail
+        base="https://huggingface.co/datasets/${HF_REPO}/resolve/main"
+        for url in \
+          "${base}/xodos-main/dists/stable/Release" \
+          "${base}/xodos-main/dists/stable/main/binary-aarch64/Packages.gz" \
+          "${base}/xodos-main/pool/main/a/apt/" \
+          "${base}/xodos-tur/dists/tur-packages/Release" \
+        ; do
+          code=$(curl -s -o /dev/null -w "%{http_code}" "$url?t=$(date +%s)")
+          echo "  $code  $url"
+        done
+        echo ""
+        echo ">>> checking a sample .deb URL from main Packages:"
+        curl -fsSL "${base}/xodos-main/dists/stable/main/binary-aarch64/Packages?t=$(date +%s)" \
+          | grep '^Filename:' | head -3
 
     - name: Summary
       run: |

@@ -47,13 +47,18 @@ jobs:
       MODE: ${{ inputs.mode }}
       REPOS_IN: ${{ inputs.repos }}
       CLEAN_HF: ${{ inputs.clean_hf }}
+      # XET stays enabled — no HF_HUB_DISABLE_XET
+      HF_HUB_DISABLE_TELEMETRY: "1"
 
     steps:
       - name: Install tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq dpkg-dev apt-utils gzip jq
-          pip install -q --upgrade "huggingface_hub<1.0"
+          # Pin to >=1.29.0 — fixes the XET rate limit bug
+          pip install -q --upgrade "huggingface_hub>=1.29.0"
+          python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)"
+          python3 -c "import hf_xet; print('hf_xet OK')" 2>/dev/null || echo ">>> hf_xet not installed (XET will fall back to HTTP)"
 
       - name: Compute targets
         run: |
@@ -101,8 +106,6 @@ jobs:
           echo ">>> Mode: $MODE"
           echo ">>> Targets:"
           sed 's/^/    /' work/targets.txt
-          echo ">>> Dist/comp pairs:"
-          sed 's/^/    /' work/dist-comp.txt
 
       - name: Wipe Hugging Face repo
         if: ${{ inputs.mode == 'full' && inputs.clean_hf }}
@@ -126,24 +129,46 @@ jobs:
           PYEOF
           python3 /tmp/wipe.py
 
-      - name: Download .deb from Hugging Face
+      - name: Download .deb from Hugging Face (XET enabled)
         if: ${{ inputs.mode == 'metadata-only' }}
         run: |
           set -euo pipefail
           cat > /tmp/dl_hf.py << 'PYEOF'
-          import os
+          import os, time, sys
           from huggingface_hub import snapshot_download
+
           targets = [l.strip() for l in open("work/targets.txt") if l.strip()]
           patterns = [t + "/pool/**" for t in targets]
           print(">>> patterns:", patterns)
-          snapshot_download(
-              repo_id=os.environ["HF_REPO"],
-              repo_type="dataset",
-              allow_patterns=patterns,
-              local_dir="/tmp/hf-debs",
-              token=os.environ.get("HF_TOKEN"),
-              max_workers=8,
-          )
+          print(">>> HF_HUB_DISABLE_XET =", os.environ.get("HF_HUB_DISABLE_XET", "(unset — XET enabled)"))
+
+          last_err = None
+          for attempt in range(1, 6):
+              try:
+                  print(">>> attempt", attempt, "/ 5")
+                  snapshot_download(
+                      repo_id=os.environ["HF_REPO"],
+                      repo_type="dataset",
+                      allow_patterns=patterns,
+                      local_dir="/tmp/hf-debs",
+                      token=os.environ.get("HF_TOKEN"),
+                      max_workers=8,
+                  )
+                  print(">>> snapshot_download OK")
+                  last_err = None
+                  break
+              except Exception as e:
+                  msg = str(e)
+                  last_err = e
+                  if "429" in msg or "Too Many Requests" in msg or "rate limit" in msg.lower():
+                      sleep_s = attempt * 90
+                      print(f">>> rate limited (attempt {attempt}/5), sleeping {sleep_s}s")
+                      time.sleep(sleep_s)
+                  else:
+                      print(">>> non-rate-limit error:", type(e).__name__, msg[:300])
+                      raise
+          if last_err:
+              raise SystemExit(f"::error::gave up after 5 attempts: {last_err}")
           PYEOF
           python3 /tmp/dl_hf.py
           n=$(find /tmp/hf-debs -type f -name '*.deb' | wc -l)
@@ -361,15 +386,13 @@ jobs:
               cp "$target/dists/$dist/Release" "$target/dists/$dist/InRelease"
             done
           done
-          echo ">>> dists tree:"
-          find "$BUILD" -type f | sort | sed 's/^/    /'
           echo ">>> dists size: $(du -sh "$BUILD" | awk '{print $1}')"
 
       - name: Upload to Hugging Face
         run: |
           set -euo pipefail
           cat > /tmp/upload.py << 'PYEOF'
-          import os
+          import os, time
           from huggingface_hub import HfApi
           api = HfApi()
           repo = os.environ["HF_REPO"]
@@ -379,6 +402,21 @@ jobs:
           print(">>> HF repo:", repo, "| mode:", mode)
           targets = [l.strip() for l in open("work/targets.txt") if l.strip()]
 
+          def with_retry(fn, label):
+              for attempt in range(1, 6):
+                  try:
+                      fn()
+                      return
+                  except Exception as e:
+                      msg = str(e)
+                      if "429" in msg or "Too Many Requests" in msg or "rate limit" in msg.lower():
+                          sleep_s = attempt * 60
+                          print(f">>> {label}: rate limited (attempt {attempt}/5), sleeping {sleep_s}s")
+                          time.sleep(sleep_s)
+                      else:
+                          raise
+              raise SystemExit(f"::error::{label} failed after 5 attempts")
+
           if mode == "pool-only":
               for t in targets:
                   local_pool = "/tmp/pool-tree/" + t + "/pool"
@@ -386,13 +424,13 @@ jobs:
                       print(">>> skip pool", t)
                       continue
                   print(">>> uploading", t + "/pool/ ...")
-                  api.upload_large_folder(
+                  with_retry(lambda t=t, local_pool=local_pool: api.upload_large_folder(
                       folder_path=local_pool,
                       repo_id=repo,
                       repo_type="dataset",
                       path_in_repo=t + "/pool",
                       num_workers=4,
-                  )
+                  ), f"pool upload {t}")
                   print(">>> uploaded", t + "/pool/")
               raise SystemExit(0)
 
@@ -411,13 +449,13 @@ jobs:
                       print(">>> skip pool", t)
                       continue
                   print(">>> uploading", t + "/pool/ ...")
-                  api.upload_large_folder(
+                  with_retry(lambda t=t, local_pool=local_pool: api.upload_large_folder(
                       folder_path=local_pool,
                       repo_id=repo,
                       repo_type="dataset",
                       path_in_repo=t + "/pool",
                       num_workers=4,
-                  )
+                  ), f"pool upload {t}")
                   print(">>> uploaded", t + "/pool/")
 
           for t in targets:
@@ -426,14 +464,14 @@ jobs:
                   print(">>> skip dists", t)
                   continue
               print(">>> uploading", t + "/dists/ ...")
-              api.upload_folder(
+              with_retry(lambda t=t, local_dists=local_dists: api.upload_folder(
                   folder_path=local_dists,
                   path_in_repo=t + "/dists",
                   repo_id=repo,
                   repo_type="dataset",
                   token=token,
                   commit_message="Regenerate " + t + " APT metadata",
-              )
+              ), f"dists upload {t}")
               print(">>> uploaded", t + "/dists/")
           print(">>> done")
           PYEOF
@@ -464,4 +502,6 @@ jobs:
             echo "**Mode:** \`${{ inputs.mode }}\`"
             echo "**Repos:** \`${{ inputs.repos }}\`"
             echo "**clean_hf:** \`${{ inputs.clean_hf }}\`"
+            echo "**huggingface_hub:** $(python3 -c 'import huggingface_hub; print(huggingface_hub.__version__)')"
+            echo "**XET:** enabled"
           } >> $GITHUB_STEP_SUMMARY

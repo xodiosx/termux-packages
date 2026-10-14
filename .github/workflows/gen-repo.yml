@@ -31,8 +31,8 @@ jobs:
       HF_REPO: ${{ inputs.hf_repo_id }}
       SRC: ${{ github.repository }}
       CLEAN_HF: ${{ inputs.clean_hf }}
-      # Use the existing PAT — this is the only line that changed.
       GH_TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
+
     steps:
 
     - name: Install tools
@@ -53,9 +53,6 @@ jobs:
           echo "::warning::Using an installation token (1000/hr). Set GH_PUSH_TOKEN to a PAT for 5000/hr."
         fi
 
-    # ==================================================================
-    # 1. Resolve tags
-    # ==================================================================
     - name: Resolve tags
       env:
         INPUT_TAGS: ${{ inputs.tags }}
@@ -97,9 +94,6 @@ jobs:
         echo ">>> Groups:"
         sort /tmp/plan/groups.txt | sed 's/^/    /'
 
-    # ==================================================================
-    # 2. Clean HF repo (optional)
-    # ==================================================================
     - name: Clean Hugging Face repo
       if: ${{ inputs.clean_hf }}
       run: |
@@ -123,7 +117,7 @@ jobs:
         "
 
     # ==================================================================
-    # 3. Download with retry + backoff
+    # Download — the print-sample line no longer pipes find into head.
     # ==================================================================
     - name: Download from GitHub Releases
       run: |
@@ -175,11 +169,14 @@ jobs:
             count_all=$(find "$tmpdir" -maxdepth 1 -type f | wc -l)
             count_deb=$(find "$tmpdir" -maxdepth 1 -type f -name '*.deb' | wc -l)
             echo "    assets: $count_all total, $count_deb .deb"
+
+            # FIX: write listing to file first, then head the file.
+            find "$tmpdir" -maxdepth 1 -type f -printf '%f\n' > /tmp/asset-list.txt
             if [ "$count_all" -le 5 ]; then
-              find "$tmpdir" -maxdepth 1 -type f -printf '        %f\n'
+              sed 's/^/        /' /tmp/asset-list.txt
             else
               echo "        (showing first 3)"
-              find "$tmpdir" -maxdepth 1 -type f -printf '        %f\n' | head -3
+              head -3 /tmp/asset-list.txt | sed 's/^/        /'
               echo "        ..."
             fi
 
@@ -226,9 +223,6 @@ jobs:
           exit 1
         fi
 
-    # ==================================================================
-    # 4. Build full APT tree
-    # ==================================================================
     - name: Build APT repository tree
       run: |
         set -euo pipefail
@@ -335,9 +329,6 @@ jobs:
         echo ">>> total .deb: $(find "$BUILD" -type f -name '*.deb' | wc -l)"
         echo ">>> total size: $(du -sh "$BUILD" | awk '{print $1}')"
 
-    # ==================================================================
-    # 5. Ensure HF repo exists
-    # ==================================================================
     - name: Ensure HF repo exists
       run: |
         set -euo pipefail
@@ -353,9 +344,6 @@ jobs:
         print('>>> repo ready:', os.environ['HF_REPO'])
         "
 
-    # ==================================================================
-    # 6. Upload to Hugging Face
-    # ==================================================================
     - name: Upload to Hugging Face
       run: |
         set -euo pipefail
@@ -377,9 +365,6 @@ jobs:
         print('>>> upload complete')
         "
 
-    # ==================================================================
-    # 7. Verify
-    # ==================================================================
     - name: Verify
       run: |
         set -euo pipefail

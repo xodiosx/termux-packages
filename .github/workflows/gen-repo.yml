@@ -133,9 +133,6 @@ jobs:
           PYEOF
           python3 /tmp/wipe.py
 
-      # ==================================================================
-      # DOWNLOAD from Hugging Face (metadata-only mode)
-      # ==================================================================
       - name: Download .deb from Hugging Face (validated)
         if: ${{ inputs.mode == 'metadata-only' }}
         run: |
@@ -214,11 +211,6 @@ jobs:
           n=$(find /tmp/hf-debs -type f -name '*.deb' | wc -l)
           echo ">>> valid .deb on disk: $n"
 
-      # ==================================================================
-      # DOWNLOAD from GitHub Releases
-      # - 1 API call per tag (gh release view --json assets)
-      # - CDN URLs for downloads — no rate limit, shows progress
-      # ==================================================================
       - name: Download .deb from GitHub Releases
         if: ${{ inputs.mode != 'metadata-only' }}
         run: |
@@ -227,7 +219,6 @@ jobs:
           mkdir -p /tmp/gh-debs
           : > "$WORK_DIR/tags-for-run.txt"
 
-          # 1. Find matching tags (1 API call for the whole list)
           echo ">>> listing tags from $SRC_REPO ..."
           mapfile -t TAGS < <(
             gh release list --repo "$SRC_REPO" --limit 1000 \
@@ -259,13 +250,11 @@ jobs:
           echo ">>> tags to download:"
           sed 's/^/    /' "$WORK_DIR/tags-for-run.txt"
 
-          # 2. Per-tag: list assets (1 API call) then curl each (CDN, no API)
           download_tag() {
             local tag="$1" target="$2"
             local dest="/tmp/gh-debs/$target"
             mkdir -p "$dest"
 
-            # List assets for this tag — 1 API call
             local assets_file="/tmp/assets-${tag}.txt"
             if ! gh release view "$tag" --repo "$SRC_REPO" \
                  --json assets --jq '.assets[].name' > "$assets_file" 2>/tmp/gh_err.log; then
@@ -275,12 +264,10 @@ jobs:
             local total
             total=$(wc -l < "$assets_file")
             echo "        $total assets in release"
-
             if [ "$total" -eq 0 ]; then
               echo "        no assets"; return 1
             fi
 
-            # Download each asset from the public CDN URL
             local ok=0 fail=0 count=0
             while IFS= read -r fname; do
               [ -z "$fname" ] && continue
@@ -509,10 +496,7 @@ jobs:
               raise SystemExit(0)
 
           def local_pool_dir(t):
-              if mode == "metadata-only":
-                  p = "/tmp/hf-debs/" + t + "/pool"
-              else:
-                  p = "/tmp/pool-tree/" + t + "/pool"
+              p = ("/tmp/hf-debs/" + t + "/pool") if mode == "metadata-only" else ("/tmp/pool-tree/" + t + "/pool")
               return p if os.path.isdir(p) else None
 
           def local_dists_dir(t):
@@ -592,6 +576,9 @@ jobs:
           PYEOF
           python3 /tmp/upload.py
 
+      # ==================================================================
+      # Verify — NO pipe to head. Writes to files, then reads them.
+      # ==================================================================
       - name: Verify URLs
         run: |
           set -euo pipefail
@@ -613,7 +600,16 @@ jobs:
           for target in $(cat "$WORK_DIR/targets-built.txt"); do
             sample=$(find "/tmp/aptrepo/$target" -name Packages | head -1)
             [ -z "$sample" ] && continue
-            fname=$(grep '^Filename:' "$sample" | head -1 | sed 's/^Filename: //')
+
+            # FIX: write grep output to a file, then read it — no pipe to head.
+            grep '^Filename:' "$sample" > /tmp/sample-fname.txt || true
+            if [ ! -s /tmp/sample-fname.txt ]; then
+              echo "  MISSING Filename: in $sample"
+              fail=$((fail+1))
+              continue
+            fi
+            fname=$(head -1 /tmp/sample-fname.txt | sed 's/^Filename: //')
+
             url="${base}/${target}/${fname}"
             code=$(curl -sL -o /dev/null -w "%{http_code}" "$url")
             printf '  %s  %s/%s\n' "$code" "$target" "$fname"

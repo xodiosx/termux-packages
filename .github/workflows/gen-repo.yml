@@ -26,6 +26,9 @@ permissions:
 jobs:
   generate-metadata:
     runs-on: ubuntu-24.04
+    env:
+      # Use the PAT for all GitHub reads — GITHUB_TOKEN hits 1000/hr
+      GH_TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
     steps:
 
     - name: Install tools
@@ -33,17 +36,21 @@ jobs:
         sudo apt-get update -qq
         sudo apt-get install -y -qq dpkg-dev apt-utils gzip jq
         pip install -q --upgrade "huggingface_hub<1.0"
-        python3 -c 'import huggingface_hub; print("huggingface_hub", huggingface_hub.__version__)'
 
-    - name: Check disk space
-      run: df -h / /tmp 2>/dev/null || true
+    - name: Check GitHub API rate limit
+      run: |
+        set -euo pipefail
+        limit=$(gh api rate_limit --jq '.resources.core.limit' 2>/dev/null || echo "unknown")
+        remaining=$(gh api rate_limit --jq '.resources.core.remaining' 2>/dev/null || echo "unknown")
+        echo ">>> GitHub API limit: $limit requests/hour"
+        echo ">>> Remaining:       $remaining"
+        if [ "$limit" = "1000" ]; then
+          echo "::warning::Using GITHUB_TOKEN (1000/hr). Downloads will likely fail."
+          echo "::warning::Set GH_PUSH_TOKEN to a PAT with 5000/hr."
+        fi
 
-    # ==================================================================
-    # 1. Resolve tags + group by repo
-    # ==================================================================
     - name: Resolve and group tags
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         SRC: ${{ inputs.source_repo }}
         INPUT_TAGS: ${{ inputs.tags }}
         INPUT_REPOS: ${{ inputs.repos }}
@@ -78,63 +85,96 @@ jobs:
             xodos-XoDos-x11-p*)            printf 'x11\t%s\n'            "$tag" >> /tmp/plan/groups.txt ;;
             xodos-XoDos-root-p*)           printf 'root\t%s\n'           "$tag" >> /tmp/plan/groups.txt ;;
             xodos-XoDos-glibc-p*)          printf 'glibc\t%s\n'          "$tag" >> /tmp/plan/groups.txt ;;
-            *) echo ">>> skipped (unrecognised): $tag" ;;
+            *) echo ">>> skipped: $tag" ;;
           esac
         done
 
         cut -f1 /tmp/plan/groups.txt | sort -u > /tmp/plan/repos.txt
         echo ">>> Repos present:"
         sed 's/^/    /' /tmp/plan/repos.txt
-        echo ""
-        echo ">>> Full tag → repo mapping:"
-        sort /tmp/plan/groups.txt | sed 's/^/    /'
 
     # ==================================================================
-    # 2. Download .deb from GitHub (kept, will be uploaded to HF pool)
+    # Download with retry + fail-on-partial
     # ==================================================================
     - name: Download .deb from GitHub
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         SRC: ${{ inputs.source_repo }}
       run: |
         set -euo pipefail
         rm -rf /tmp/raw-debs
         mkdir -p /tmp/raw-debs
 
+        # Retry wrapper for gh release download
+        download_tag() {
+          local tag="$1" dest="$2"
+          local attempt=1
+          local max=6
+          while [ "$attempt" -le "$max" ]; do
+            if gh release download "$tag" --repo "$SRC" \
+                 --pattern "*.deb" --dir "$dest" 2>/tmp/gh_err.log; then
+              return 0
+            fi
+            if grep -qiE 'rate limit|403|429|secondary' /tmp/gh_err.log; then
+              local backoff=$((attempt * 60))
+              echo "        rate limited (attempt $attempt/$max), sleeping ${backoff}s"
+              sleep "$backoff"
+            else
+              local backoff=$((attempt * 10))
+              echo "        download error (attempt $attempt/$max), sleeping ${backoff}s"
+              head -2 /tmp/gh_err.log | sed 's/^/            /' || true
+              sleep "$backoff"
+            fi
+            attempt=$((attempt + 1))
+          done
+          return 1
+        }
+
+        failed_tags=""
+
         while IFS= read -r repo; do
           [ -z "$repo" ] && continue
           echo ">>> repo: $repo"
           mkdir -p "/tmp/raw-debs/$repo"
+
           while IFS= read -r tag; do
             [ -z "$tag" ] && continue
             echo "    downloading: $tag"
             tmpdir=$(mktemp -d)
-            if gh release download "$tag" --repo "$SRC" \
-                 --pattern "*.deb" --dir "$tmpdir" 2>/dev/null
-            then
-              n=$(find "$tmpdir" -maxdepth 1 -type f -name '*.deb' | wc -l)
-              echo "    got $n .deb"
-              find "$tmpdir" -maxdepth 1 -type f -name '*.deb' -print0 \
-                | xargs -0r mv -t "/tmp/raw-debs/$repo/"
+            if ! download_tag "$tag" "$tmpdir"; then
+              echo "    FAIL: could not download $tag"
+              failed_tags="$failed_tags $tag"
+              rm -rf "$tmpdir"
+              continue
             fi
+            n=$(find "$tmpdir" -maxdepth 1 -type f -name '*.deb' | wc -l)
+            echo "    got $n .deb"
+            find "$tmpdir" -maxdepth 1 -type f -name '*.deb' -print0 \
+              | xargs -0r mv -t "/tmp/raw-debs/$repo/"
             rm -rf "$tmpdir"
+            sleep 2
           done < <(grep -P "^${repo}\t" /tmp/plan/groups.txt | cut -f2)
 
           total=$(find "/tmp/raw-debs/$repo" -maxdepth 1 -type f -name '*.deb' 2>/dev/null | wc -l)
           echo ">>> repo $repo: $total .deb total"
         done < /tmp/plan/repos.txt
 
+        if [ -n "$failed_tags" ]; then
+          echo ""
+          echo "::error::These tags failed to download:"
+          for t in $failed_tags; do
+            echo "::error::    $t"
+          done
+          echo "::error::Rate limit? Wait 1 hour and retry, or set GH_PUSH_TOKEN to a PAT."
+          exit 1
+        fi
+
         echo ""
         echo ">>> raw-debs size: $(du -sh /tmp/raw-debs | awk '{print $1}')"
 
     # ==================================================================
-    # 3. Build local tree:
-    #      /tmp/aptrepo/<target>/dists/...  (metadata)
-    #      /tmp/aptrepo/<target>/pool/<comp>/<letter>/<pkg>/<file>.deb
-    #    Filename in Packages uses the relative pool path.
-    #    Uses mv to save disk (raw-debs shrinks as we go).
+    # Build local tree (dists + pool)
     # ==================================================================
-    - name: Build local APT tree (dists + pool)
+    - name: Build local APT tree
       run: |
         set -euo pipefail
         BUILD=/tmp/aptrepo
@@ -151,53 +191,42 @@ jobs:
             tur)            target=xodos-tur;   dist=tur-packages; comp=tur ;;
             tur-on-device)  target=xodos-tur;   dist=tur-packages; comp=tur-on-device ;;
             tur-continuous) target=xodos-tur;   dist=tur-packages; comp=tur-continuous ;;
-            *) echo ">>> skip unknown repo: $repo"; continue ;;
+            *) continue ;;
           esac
-
-          echo ">>> building $target/dists/$dist/$comp  (source repo: $repo)"
 
           outd="$BUILD/$target/dists/$dist/$comp/binary-aarch64"
           pooldir="$BUILD/$target/pool/$comp"
           mkdir -p "$outd" "$pooldir"
           : > "$outd/Packages"
 
-          # --- Pass 1: build TSV of all .deb ---
           tsv="/tmp/all-${repo}.tsv"
           : > "$tsv"
           shopt -s nullglob
           for deb in /tmp/raw-debs/"$repo"/*.deb; do
             dpkg-deb -I "$deb" >/dev/null 2>&1 || continue
-            pkg=$(dpkg-deb -f "$deb" Package)
-            ver=$(dpkg-deb -f "$deb" Version)
-            printf '%s\t%s\t%s\n' "$pkg" "$ver" "$deb" >> "$tsv"
+            printf '%s\t%s\t%s\n' \
+              "$(dpkg-deb -f "$deb" Package)" \
+              "$(dpkg-deb -f "$deb" Version)" \
+              "$deb" >> "$tsv"
           done
           shopt -u nullglob
 
           in_count=$(wc -l < "$tsv")
-          echo "    input .deb: $in_count"
-          if [ "$in_count" -eq 0 ]; then
-            echo "    WARN: no .deb for $repo — skipping"
-            continue
-          fi
+          echo ">>> $target: input=$in_count"
+          [ "$in_count" -eq 0 ] && continue
 
-          # --- Dedup: keep highest version of each package ---
           sort -t$'\t' -k1,1 -k2,2rV "$tsv" | awk -F'\t' '!seen[$1]++' > "/tmp/winners-${repo}.tsv"
 
-          # --- Pass 2: move .deb into pool + emit Packages entry ---
           placed=0
           while IFS=$'\t' read -r pkg ver path; do
             [ -z "$pkg" ] && continue
-
             fname=$(basename "$path")
             first_letter=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
             rel_path="pool/${comp}/${first_letter}/${pkg}/${fname}"
             dest_dir="$pooldir/${first_letter}/${pkg}"
             mkdir -p "$dest_dir"
-
-            # Move the .deb into pool (frees disk in /tmp/raw-debs)
             mv "$path" "$dest_dir/"
 
-            # Hashes computed on the pool copy
             new_path="$dest_dir/$fname"
             size=$(stat -c %s "$new_path")
             md5=$(md5sum "$new_path" | awk '{print $1}')
@@ -215,22 +244,14 @@ jobs:
             } >> "$outd/Packages"
             placed=$((placed + 1))
           done < "/tmp/winners-${repo}.tsv"
-
-          echo "    entries: $placed"
+          echo "    placed: $placed"
           gzip -kf -9 "$outd/Packages"
-          rm -f "$outd/Packages.xz"
-
-          # Drop the leftover TSVs for this repo
-          rm -f "$tsv" "/tmp/winners-${repo}.tsv"
+          rm -f "$outd/Packages.xz" "$tsv" "/tmp/winners-${repo}.tsv"
         done < /tmp/plan/repos.txt
 
-        echo ""
-        echo ">>> raw-debs remaining: $(du -sh /tmp/raw-debs 2>/dev/null | awk '{print $1}')"
-        echo ">>> aptrepo size: $(du -sh "$BUILD" | awk '{print $1}')"
+        echo ">>> aptrepo: $(du -sh "$BUILD" | awk '{print $1}')"
+        echo ">>> .deb total: $(find "$BUILD" -type f -name '*.deb' | wc -l)"
 
-    # ==================================================================
-    # 4. Generate Release files
-    # ==================================================================
     - name: Generate Release files
       run: |
         set -euo pipefail
@@ -242,7 +263,6 @@ jobs:
           for dist_dir in "$target"/dists/*/; do
             [ -d "$dist_dir" ] || continue
             dist="$(basename "$dist_dir")"
-
             comps=""
             for comp_dir in "$dist_dir"*/; do
               [ -d "$comp_dir" ] || continue
@@ -251,11 +271,7 @@ jobs:
                 comps="${comps}${comps:+ }$comp"
               fi
             done
-
-            if [ -z "$comps" ]; then
-              echo ">>> skip empty dist: $target/dists/$dist"
-              continue
-            fi
+            [ -z "$comps" ] && continue
 
             conf="/tmp/release-${target}-${dist}.conf"
             {
@@ -267,25 +283,13 @@ jobs:
               echo "APT::FTPArchive::Release::Components \"${comps}\";"
               echo "APT::FTPArchive::Release::Description \"xodos ${target} (${dist})\";"
             } > "$conf"
-
-            echo ">>> release: $target/dists/$dist  (comps: $comps)"
-            apt-ftparchive -c "$conf" release "$target/dists/$dist" \
-              > "$target/dists/$dist/Release"
+            apt-ftparchive -c "$conf" release "$target/dists/$dist" > "$target/dists/$dist/Release"
             cp "$target/dists/$dist/Release" "$target/dists/$dist/InRelease"
           done
         done
 
-        echo ""
-        echo ">>> final tree (top 2 levels):"
-        find "$BUILD" -maxdepth 3 -type d | sort | sed 's/^/    /'
-        echo ""
-        echo ">>> total size: $(du -sh "$BUILD" | awk '{print $1}')"
-        echo ">>> total .deb: $(find "$BUILD" -type f -name '*.deb' | wc -l)"
-
     # ==================================================================
-    # 5. Upload to Hugging Face
-    #    - Delete ONLY stale dists/ (pool is preserved)
-    #    - Upload everything with upload_large_folder
+    # Upload — clear only dists/, upload everything
     # ==================================================================
     - name: Upload to Hugging Face
       env:
@@ -296,78 +300,37 @@ jobs:
         python3 -c "
         import os
         from huggingface_hub import HfApi
-
         api = HfApi()
         repo = os.environ['HF_REPO']
-
         api.create_repo(repo_id=repo, repo_type='dataset', exist_ok=True)
-        print('>>> HF repo ready:', repo)
 
-        # --- 1. Delete ONLY stale dists under each target ---
         targets = ['xodos-main', 'xodos-x11', 'xodos-root', 'xodos-glibc', 'xodos-tur']
         for t in targets:
             try:
-                api.delete_files(
-                    repo_id=repo,
-                    repo_type='dataset',
-                    delete_patterns=[t + '/dists/**'],
-                )
-                print('>>> cleared stale', t + '/dists/**')
+                api.delete_files(repo_id=repo, repo_type='dataset',
+                                 delete_patterns=[t + '/dists/**'])
+                print('>>> cleared', t + '/dists/**')
             except Exception as e:
-                print('>>> skip clear for', t, ':', type(e).__name__, e)
+                print('>>> skip clear', t, type(e).__name__)
 
-        # --- 2. Upload whole /tmp/aptrepo (dists + pool) ---
-        # upload_large_folder hashes files and skips unchanged ones,
-        # so only new/modified files are actually transferred.
         print('>>> uploading /tmp/aptrepo ...')
-        api.upload_large_folder(
-            folder_path='/tmp/aptrepo',
-            repo_id=repo,
-            repo_type='dataset',
-            num_workers=4,
-        )
-        print('>>> upload complete')
+        api.upload_large_folder(folder_path='/tmp/aptrepo',
+                                 repo_id=repo, repo_type='dataset', num_workers=4)
+        print('>>> done')
         "
-
-    - name: Verify live URLs
-      env:
-        HF_REPO: ${{ inputs.hf_repo_id }}
-      run: |
-        set -euo pipefail
-        base="https://huggingface.co/datasets/${HF_REPO}/resolve/main"
-        for url in \
-          "${base}/xodos-main/dists/stable/Release" \
-          "${base}/xodos-main/dists/stable/main/binary-aarch64/Packages.gz" \
-          "${base}/xodos-main/pool/main/a/apt/" \
-          "${base}/xodos-tur/dists/tur-packages/Release" \
-        ; do
-          code=$(curl -s -o /dev/null -w "%{http_code}" "$url?t=$(date +%s)")
-          echo "  $code  $url"
-        done
-        echo ""
-        echo ">>> checking a sample .deb URL from main Packages:"
-        curl -fsSL "${base}/xodos-main/dists/stable/main/binary-aarch64/Packages?t=$(date +%s)" \
-          | grep '^Filename:' | head -3
 
     - name: Summary
       run: |
         {
-          echo "## APT Metadata Published"
+          echo "## APT Repositories Published"
           echo ""
           echo "Base: \`https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main\`"
           echo ""
-          echo "### sources.list entries"
-          echo ""
-          echo '**Official Termux repos (mirrored by xodos):**'
           echo '```'
           echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-main stable main"
           echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-x11 x11 main"
           echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-root root stable"
           echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-glibc glibc main"
-          echo '```'
-          echo ""
-          echo '**TUR (mirrored by xodos):**'
-          echo '```'
           echo "deb [trusted=yes] https://huggingface.co/datasets/${{ inputs.hf_repo_id }}/resolve/main/xodos-tur tur-packages tur tur-on-device tur-continuous"
           echo '```'
         } >> $GITHUB_STEP_SUMMARY

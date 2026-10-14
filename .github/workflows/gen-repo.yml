@@ -24,8 +24,12 @@ on:
         description: "GitHub repo with releases (used in full / pool-only)"
         required: false
         default: "xodiosx/termux-packages"
+      force_push:
+        description: "FORCE PUSH: delete everything on HF, upload only the built targets. DESTRUCTIVE."
+        type: boolean
+        default: false
       clean_hf:
-        description: "Wipe the whole HF repo before upload (full mode only)"
+        description: "Wipe the ENTIRE HF repo before upload (full mode only)"
         type: boolean
         default: false
 
@@ -46,6 +50,7 @@ jobs:
       SRC_REPO: ${{ inputs.source_repo }}
       MODE: ${{ inputs.mode }}
       REPOS_IN: ${{ inputs.repos }}
+      FORCE_PUSH: ${{ inputs.force_push }}
       CLEAN_HF: ${{ inputs.clean_hf }}
       HF_HUB_DISABLE_TELEMETRY: "1"
       WORK_DIR: ${{ github.workspace }}/work
@@ -100,11 +105,16 @@ jobs:
           done
           sort -u "$WORK_DIR/targets.txt" -o "$WORK_DIR/targets.txt"
           sort -u "$WORK_DIR/dist-comp.txt" -o "$WORK_DIR/dist-comp.txt"
+          echo ">>> Mode: $MODE"
+          echo ">>> Force push: $FORCE_PUSH"
+          echo ">>> Targets:"
+          sed 's/^/    /' "$WORK_DIR/targets.txt"
 
-      - name: Wipe Hugging Face repo
+      - name: Wipe Hugging Face repo (full wipe)
         if: ${{ inputs.mode == 'full' && inputs.clean_hf }}
         run: |
           set -euo pipefail
+          echo "::warning::clean_hf=true — DELETING entire HF repo"
           cat > /tmp/wipe.py << 'PYEOF'
           import os
           from huggingface_hub import HfApi
@@ -148,10 +158,9 @@ jobs:
           if token:
               headers["Authorization"] = f"Bearer {token}"
 
-          def is_valid_deb_bytes(data: bytes) -> bool:
-              return data.startswith(b"!<arch>")
-          def is_html_bytes(data: bytes) -> bool:
-              head = data[:512].lower()
+          def is_valid_deb_bytes(b): return b.startswith(b"!<arch>")
+          def is_html_bytes(b):
+              head = b[:512].lower()
               return b"<!doctype" in head or b"<html" in head
 
           def fetch(rel):
@@ -175,7 +184,7 @@ jobs:
                           if not is_valid_deb_bytes(data[:8]):
                               if is_html_bytes(data):
                                   raise ValueError("HTML response body")
-                              raise ValueError(f"not a .deb (starts with {data[:8]!r})")
+                              raise ValueError(f"not a .deb ({data[:8]!r})")
                           with open(out, "wb") as f:
                               f.write(data)
                           return ("ok", rel)
@@ -185,8 +194,7 @@ jobs:
                   except Exception as e:
                       last_err = f"{type(e).__name__}: {str(e)[:80]}"
                       time.sleep(min(30, attempt * 3))
-              if out.exists():
-                  out.unlink()
+              if out.exists(): out.unlink()
               return ("fail", rel, last_err)
 
           ok = cached = fail = 0
@@ -303,9 +311,7 @@ jobs:
           done < "$WORK_DIR/tags-for-run.txt"
 
       # ==================================================================
-      # Build dists — Filename is now RELATIVE to the sources.list base URL.
-      # Since sources.list base = ".../resolve/main/xodos-main", the
-      # Filename must be "pool/main/..." not "xodos-main/pool/main/...".
+      # Build dists — Filename is relative to the sources.list base URL.
       # ==================================================================
       - name: Build dists metadata
         run: |
@@ -340,7 +346,6 @@ jobs:
               [ -z "$pkg" ] && continue
               fname=$(basename "$deb")
               fl=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
-              # FIX: Filename relative to sources.list base (no target prefix)
               relpath="pool/${comp}/${fl}/${pkg}/${fname}"
               size=$(stat -c %s "$deb")
               md5=$(md5sum "$deb" | awk '{print $1}')
@@ -404,6 +409,9 @@ jobs:
             fi
           done < "$WORK_DIR/targets.txt"
 
+          echo ">>> built:   $(wc -l < "$WORK_DIR/targets-built.txt")"
+          echo ">>> missing: $(wc -l < "$WORK_DIR/targets-missing.txt")"
+
       - name: Validate .deb before upload
         run: |
           set -euo pipefail
@@ -422,6 +430,11 @@ jobs:
           [ "$bad" -gt 0 ] && { echo "::error::refusing to upload"; exit 1; }
           echo ">>> all valid"
 
+      # ==================================================================
+      # Upload — with FORCE PUSH support
+      #   force_push=false → replace dists/ for selected targets (safe)
+      #   force_push=true  → delete everything on HF, upload local tree
+      # ==================================================================
       - name: Upload to Hugging Face
         run: |
           set -euo pipefail
@@ -433,17 +446,26 @@ jobs:
           token = os.environ["HF_TOKEN"]
           mode = os.environ["MODE"]
           work = os.environ["WORK_DIR"]
+          force_push = os.environ["FORCE_PUSH"].lower() == "true"
+
           api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True, token=token)
           built = [l.strip() for l in open(work + "/targets-built.txt") if l.strip()]
+          print(f">>> HF repo: {repo} | mode: {mode} | force_push: {force_push}")
+          print(f">>> built targets: {built}")
 
           def upload_folder_any(folder_path, path_in_repo, label):
               if hasattr(api, "upload_large_folder"):
                   os.environ["HF_TOKEN"] = token
-                  api.upload_large_folder(folder_path=folder_path, repo_id=repo,
-                      repo_type="dataset", path_in_repo=path_in_repo, num_workers=4)
+                  api.upload_large_folder(
+                      folder_path=folder_path, repo_id=repo,
+                      repo_type="dataset", path_in_repo=path_in_repo, num_workers=4,
+                  )
               else:
-                  api.upload_folder(folder_path=folder_path, repo_id=repo,
-                      repo_type="dataset", path_in_repo=path_in_repo, token=token)
+                  api.upload_folder(
+                      folder_path=folder_path, repo_id=repo,
+                      repo_type="dataset", path_in_repo=path_in_repo,
+                      token=token, commit_message=f"Upload {path_in_repo}",
+                  )
 
           def with_retry(fn, label):
               for attempt in range(1, 6):
@@ -456,35 +478,58 @@ jobs:
                           raise
               raise SystemExit(f"::error::{label} failed")
 
+          # ---------- FORCE PUSH: delete everything on HF ----------
+          if force_push:
+              print(">>> FORCE PUSH: listing all files on HF ...")
+              all_files = list(api.list_repo_files(repo_id=repo, repo_type="dataset", token=token))
+              print(f">>> total files to delete: {len(all_files)}")
+              if all_files:
+                  # delete_files with pattern "*" removes everything at once
+                  print(">>> deleting all files ...")
+                  api.delete_files(
+                      repo_id=repo, repo_type="dataset",
+                      delete_patterns=["*"], token=token,
+                      commit_message="Force push: clearing repo",
+                  )
+                  print(">>> repo cleared")
+
+          # ---------- POOL-ONLY (unchanged) ----------
           if mode == "pool-only":
               for t in built:
                   lp = "/tmp/pool-tree/" + t + "/pool"
                   if os.path.isdir(lp):
+                      print(f">>> uploading {t}/pool/ ...")
                       with_retry(lambda t=t, lp=lp: upload_folder_any(lp, t + "/pool", f"pool {t}"), f"pool {t}")
+                      print(f">>> uploaded {t}/pool/")
               raise SystemExit(0)
 
-          for t in built:
-              try:
-                  api.delete_files(repo_id=repo, repo_type="dataset",
-                                   delete_patterns=[t + "/dists/**"], token=token)
-                  print(">>> cleared", t + "/dists/**")
-              except Exception as e:
-                  print(">>> WARN clear", t, type(e).__name__)
+          # ---------- non-force: clear only selected dists/ ----------
+          if not force_push:
+              for t in built:
+                  try:
+                      api.delete_files(repo_id=repo, repo_type="dataset",
+                                       delete_patterns=[t + "/dists/**"], token=token)
+                      print(">>> cleared", t + "/dists/**")
+                  except Exception as e:
+                      print(">>> WARN clear", t, type(e).__name__)
 
+          # ---------- upload pool/ (full mode) ----------
           if mode == "full":
               for t in built:
                   lp = "/tmp/pool-tree/" + t + "/pool"
                   if os.path.isdir(lp):
-                      print(">>> uploading", t + "/pool/ ...")
+                      print(f">>> uploading {t}/pool/ ...")
                       with_retry(lambda t=t, lp=lp: upload_folder_any(lp, t + "/pool", f"pool {t}"), f"pool {t}")
-                      print(">>> uploaded", t + "/pool/")
+                      print(f">>> uploaded {t}/pool/")
 
+          # ---------- upload dists/ ----------
           for t in built:
               ld = "/tmp/aptrepo/" + t + "/dists"
               if os.path.isdir(ld):
-                  print(">>> uploading", t + "/dists/ ...")
+                  print(f">>> uploading {t}/dists/ ...")
                   with_retry(lambda t=t, ld=ld: upload_folder_any(ld, t + "/dists", f"dists {t}"), f"dists {t}")
-                  print(">>> uploaded", t + "/dists/")
+                  print(f">>> uploaded {t}/dists/")
+          print(">>> done")
           PYEOF
           python3 /tmp/upload.py
 
@@ -506,9 +551,8 @@ jobs:
             done
           done < "$WORK_DIR/dist-comp.txt"
 
-          # CRITICAL: verify a sample Filename actually resolves
           echo ""
-          echo ">>> sample .deb URL sanity check:"
+          echo ">>> sample .deb URL sanity:"
           for target in $(cat "$WORK_DIR/targets-built.txt"); do
             sample=$(find "/tmp/aptrepo/$target" -name Packages | head -1)
             [ -z "$sample" ] && continue
@@ -521,3 +565,36 @@ jobs:
 
           [ "$fail" -gt 0 ] && { echo "::error::$fail URLs unreachable"; exit 1; }
           echo ">>> all URLs OK"
+
+      - name: Report missing targets
+        if: always()
+        run: |
+          set -euo pipefail
+          [ -s "$WORK_DIR/targets-missing.txt" ] || { echo ">>> all targets built"; exit 0; }
+          echo "::error::Targets with no pool data:"
+          while read -r t; do [ -z "$t" ] || echo "::error::    $t"; done < "$WORK_DIR/targets-missing.txt"
+          exit 1
+
+      - name: Summary
+        run: |
+          {
+            echo "## APT Repository Regenerated"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Mode** | \`${{ inputs.mode }}\` |"
+            echo "| **Repos** | \`${{ inputs.repos }}\` |"
+            echo "| **Force push** | \`${{ inputs.force_push }}\` |"
+            echo "| **Clean HF** | \`${{ inputs.clean_hf }}\` |"
+            echo ""
+            echo "### Built this run"
+            echo '```'
+            cat "$WORK_DIR/targets-built.txt" 2>/dev/null || echo "(none)"
+            echo '```'
+            if [ -s "$WORK_DIR/targets-missing.txt" ]; then
+              echo "### Missing"
+              echo '```'
+              cat "$WORK_DIR/targets-missing.txt"
+              echo '```'
+            fi
+          } >> $GITHUB_STEP_SUMMARY

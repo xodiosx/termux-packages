@@ -56,8 +56,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq dpkg-dev apt-utils gzip jq
           pip install -q --upgrade "huggingface_hub>=1.29.0"
-          python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)"
-          python3 -c "import hf_xet; print('hf_xet OK')" 2>/dev/null || echo ">>> hf_xet not installed"
 
       - name: Compute targets
         run: |
@@ -102,17 +100,11 @@ jobs:
           done
           sort -u "$WORK_DIR/targets.txt" -o "$WORK_DIR/targets.txt"
           sort -u "$WORK_DIR/dist-comp.txt" -o "$WORK_DIR/dist-comp.txt"
-          echo ">>> Mode: $MODE"
-          echo ">>> Targets:"
-          sed 's/^/    /' "$WORK_DIR/targets.txt"
-          echo ">>> Dist/comp:"
-          sed 's/^/    /' "$WORK_DIR/dist-comp.txt"
 
       - name: Wipe Hugging Face repo
         if: ${{ inputs.mode == 'full' && inputs.clean_hf }}
         run: |
           set -euo pipefail
-          echo "::warning::clean_hf=true — DELETING entire HF repo"
           cat > /tmp/wipe.py << 'PYEOF'
           import os
           from huggingface_hub import HfApi
@@ -130,49 +122,93 @@ jobs:
           PYEOF
           python3 /tmp/wipe.py
 
-      - name: Download .deb from Hugging Face
+      - name: Download .deb from Hugging Face (validated)
         if: ${{ inputs.mode == 'metadata-only' }}
         run: |
           set -euo pipefail
           cat > /tmp/dl_hf.py << 'PYEOF'
-          import os, time
-          from huggingface_hub import snapshot_download
-          targets_file = os.environ["WORK_DIR"] + "/targets.txt"
-          targets = [l.strip() for l in open(targets_file) if l.strip()]
-          patterns = [t + "/pool/**" for t in targets]
-          print(">>> patterns:", patterns)
-          last_err = None
-          for attempt in range(1, 6):
-              try:
-                  print(">>> attempt", attempt, "/ 5")
-                  snapshot_download(
-                      repo_id=os.environ["HF_REPO"],
-                      repo_type="dataset",
-                      allow_patterns=patterns,
-                      local_dir="/tmp/hf-debs",
-                      token=os.environ.get("HF_TOKEN"),
-                      max_workers=8,
-                  )
-                  print(">>> snapshot_download OK")
-                  last_err = None
-                  break
-              except Exception as e:
-                  msg = str(e)
-                  last_err = e
-                  if "429" in msg or "Too Many Requests" in msg or "rate limit" in msg.lower():
-                      sleep_s = attempt * 90
-                      print(f">>> rate limited (attempt {attempt}/5), sleeping {sleep_s}s")
-                      time.sleep(sleep_s)
+          import os, sys, time, urllib.request, urllib.parse, concurrent.futures
+          import pathlib
+          from huggingface_hub import HfApi
+
+          repo = os.environ["HF_REPO"]
+          token = os.environ.get("HF_TOKEN")
+          work = os.environ["WORK_DIR"]
+          targets = [l.strip() for l in open(work + "/targets.txt") if l.strip()]
+          api = HfApi()
+          all_files = list(api.list_repo_files(repo_id=repo, repo_type="dataset", token=token))
+          prefixes = tuple(f"{t}/pool/" for t in targets)
+          selected = [f for f in all_files if f.endswith(".deb") and any(f.startswith(p) for p in prefixes)]
+          print(f">>> matching .deb: {len(selected)}")
+          if not selected:
+              raise SystemExit("::error::no matching .deb on HF")
+          BASE = f"https://huggingface.co/datasets/{repo}/resolve/main/"
+          DEST = pathlib.Path("/tmp/hf-debs")
+          headers = {"User-Agent": "xodos-pkg-sync/1.0"}
+          if token:
+              headers["Authorization"] = f"Bearer {token}"
+
+          def is_valid_deb_bytes(data: bytes) -> bool:
+              return data.startswith(b"!<arch>")
+          def is_html_bytes(data: bytes) -> bool:
+              head = data[:512].lower()
+              return b"<!doctype" in head or b"<html" in head
+
+          def fetch(rel):
+              url = BASE + urllib.parse.quote(rel, safe="/")
+              out = DEST / rel
+              out.parent.mkdir(parents=True, exist_ok=True)
+              if out.exists() and out.stat().st_size > 0:
+                  with open(out, "rb") as f:
+                      if is_valid_deb_bytes(f.read(8)):
+                          return ("cached", rel)
+                  out.unlink()
+              last_err = ""
+              for attempt in range(1, 9):
+                  try:
+                      req = urllib.request.Request(url, headers=headers)
+                      with urllib.request.urlopen(req, timeout=180) as r:
+                          ct = r.headers.get("Content-Type", "").lower()
+                          if "html" in ct or "text/" in ct:
+                              raise ValueError(f"HTML content-type: {ct}")
+                          data = r.read()
+                          if not is_valid_deb_bytes(data[:8]):
+                              if is_html_bytes(data):
+                                  raise ValueError("HTML response body")
+                              raise ValueError(f"not a .deb (starts with {data[:8]!r})")
+                          with open(out, "wb") as f:
+                              f.write(data)
+                          return ("ok", rel)
+                  except urllib.error.HTTPError as e:
+                      last_err = f"HTTP {e.code}"
+                      time.sleep(min(60, attempt * 8) if e.code == 429 else min(30, attempt * 3))
+                  except Exception as e:
+                      last_err = f"{type(e).__name__}: {str(e)[:80]}"
+                      time.sleep(min(30, attempt * 3))
+              if out.exists():
+                  out.unlink()
+              return ("fail", rel, last_err)
+
+          ok = cached = fail = 0
+          failed = []
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+              for kind, rel, *rest in ex.map(fetch, selected):
+                  if kind == "ok": ok += 1
+                  elif kind == "cached": cached += 1
                   else:
-                      print(">>> non-rate-limit error:", type(e).__name__, msg[:300])
-                      raise
-          if last_err:
-              raise SystemExit(f"::error::gave up after 5 attempts: {last_err}")
+                      fail += 1
+                      failed.append((rel, rest[0] if rest else "?"))
+                  if (ok + cached + fail) % 200 == 0:
+                      print(f">>> {ok+cached+fail}/{len(selected)}  ok={ok} cached={cached} fail={fail}")
+          print(f">>> finished: ok={ok} cached={cached} fail={fail}")
+          for rel, err in failed[:30]:
+              print(f"    FAIL {rel} — {err}")
+          if ok + cached == 0:
+              sys.exit("::error::nothing downloaded")
           PYEOF
           python3 /tmp/dl_hf.py
           n=$(find /tmp/hf-debs -type f -name '*.deb' | wc -l)
-          echo ">>> downloaded .deb: $n"
-          du -sh /tmp/hf-debs 2>/dev/null || true
+          echo ">>> valid .deb on disk: $n"
 
       - name: Download .deb from GitHub Releases
         if: ${{ inputs.mode != 'metadata-only' }}
@@ -189,11 +225,8 @@ jobs:
                 return 0
               fi
               if grep -qiE 'rate limit|403|429|secondary' /tmp/gh_err.log; then
-                echo "        rate limited (attempt $attempt/6), sleeping $((attempt*60))s"
                 sleep $((attempt*60))
               else
-                echo "        error (attempt $attempt/6), sleeping $((attempt*10))s"
-                head -2 /tmp/gh_err.log | sed 's/^/            /' || true
                 sleep $((attempt*10))
               fi
               attempt=$((attempt+1))
@@ -223,61 +256,42 @@ jobs:
               fi
             done
           done
-          if [ ! -s "$WORK_DIR/tags-for-run.txt" ]; then
-            echo "::error::No matching tags"; exit 1
-          fi
-          echo ">>> tags to download:"
-          sed 's/^/    /' "$WORK_DIR/tags-for-run.txt"
           while IFS='|' read -r target tag; do
             [ -z "$tag" ] && continue
-            echo ">>> $target / $tag"
             tmpdir=$(mktemp -d)
             if ! download_tag "$tag" "$tmpdir"; then
-              echo "    FAIL: $tag"
-              failed="$failed $tag"
-              rm -rf "$tmpdir"
-              continue
+              failed="$failed $tag"; rm -rf "$tmpdir"; continue
             fi
-            n=$(find "$tmpdir" -maxdepth 1 -name '*.deb' | wc -l)
-            echo "    got $n .deb"
             mkdir -p "/tmp/gh-debs/${target}"
-            find "$tmpdir" -maxdepth 1 -name '*.deb' -print0 \
-              | xargs -0r mv -t "/tmp/gh-debs/${target}/"
+            find "$tmpdir" -maxdepth 1 -name '*.deb' -print0 | xargs -0r mv -t "/tmp/gh-debs/${target}/"
             rm -rf "$tmpdir"
             sleep 2
           done < "$WORK_DIR/tags-for-run.txt"
-          if [ -n "$failed" ]; then
-            echo "::error::Failed tags:$failed"; exit 1
-          fi
-          total=$(find /tmp/gh-debs -type f -name '*.deb' | wc -l)
-          echo ">>> downloaded .deb: $total"
-          du -sh /tmp/gh-debs
+          if [ -n "$failed" ]; then echo "::error::Failed:$failed"; exit 1; fi
 
       - name: Stage pool tree
         if: ${{ inputs.mode != 'metadata-only' }}
         run: |
           set -euo pipefail
           POOL=/tmp/pool-tree
-          rm -rf "$POOL"
-          mkdir -p "$POOL"
+          rm -rf "$POOL"; mkdir -p "$POOL"
           while IFS='|' read -r target tag; do
             [ -z "$tag" ] && continue
             comp=""
             case "$tag" in
-              xodos-XoDos-main-p*)           comp=main ;;
-              xodos-XoDos-x11-p*)            comp=main ;;
-              xodos-XoDos-root-p*)           comp=stable ;;
-              xodos-XoDos-glibc-p*)          comp=main ;;
+              xodos-XoDos-main-p*) comp=main ;;
+              xodos-XoDos-x11-p*) comp=main ;;
+              xodos-XoDos-root-p*) comp=stable ;;
+              xodos-XoDos-glibc-p*) comp=main ;;
               xodos-XoDos-tur-continuous-p*) comp=tur-continuous ;;
-              xodos-XoDos-tur-on-device-p*)  comp=tur-on-device ;;
-              xodos-XoDos-tur-p*)            comp=tur ;;
+              xodos-XoDos-tur-on-device-p*) comp=tur-on-device ;;
+              xodos-XoDos-tur-p*) comp=tur ;;
             esac
             [ -z "$comp" ] && continue
             src="/tmp/gh-debs/${target}"
             [ -d "$src" ] || continue
             shopt -s nullglob
             for deb in "$src"/*.deb; do
-              [ -f "$deb" ] || continue
               pkg=$(dpkg-deb -f "$deb" Package 2>/dev/null || echo "")
               [ -z "$pkg" ] && continue
               fl=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
@@ -287,36 +301,28 @@ jobs:
             done
             shopt -u nullglob
           done < "$WORK_DIR/tags-for-run.txt"
-          echo ">>> .deb staged: $(find "$POOL" -type f -name '*.deb' | wc -l)"
 
+      # ==================================================================
+      # Build dists — Filename is now RELATIVE to the sources.list base URL.
+      # Since sources.list base = ".../resolve/main/xodos-main", the
+      # Filename must be "pool/main/..." not "xodos-main/pool/main/...".
+      # ==================================================================
       - name: Build dists metadata
         run: |
           set -euo pipefail
           BUILD=/tmp/aptrepo
-          rm -rf "$BUILD"
-          mkdir -p "$BUILD"
-          if [ "$MODE" = "metadata-only" ]; then
-            SRC_ROOT=/tmp/hf-debs
-          else
-            SRC_ROOT=/tmp/pool-tree
-          fi
-          echo ">>> SRC_ROOT=$SRC_ROOT"
-
+          rm -rf "$BUILD"; mkdir -p "$BUILD"
+          if [ "$MODE" = "metadata-only" ]; then SRC_ROOT=/tmp/hf-debs; else SRC_ROOT=/tmp/pool-tree; fi
           : > "$WORK_DIR/targets-built.txt"
           : > "$WORK_DIR/targets-missing.txt"
 
           while read -r target dist comp; do
             [ -z "$target" ] && continue
             pooldir="$SRC_ROOT/${target}/pool/${comp}"
-            if [ ! -d "$pooldir" ]; then
-              echo ">>> skip $target/$comp (no pool)"
-              continue
-            fi
+            [ ! -d "$pooldir" ] && { echo ">>> skip $target/$comp (no pool)"; continue; }
             outd="$BUILD/$target/dists/$dist/$comp/binary-aarch64"
-            mkdir -p "$outd"
-            : > "$outd/Packages"
-            tsv="/tmp/t-${target}-${comp}.tsv"
-            : > "$tsv"
+            mkdir -p "$outd"; : > "$outd/Packages"
+            tsv="/tmp/t-${target}-${comp}.tsv"; : > "$tsv"
             shopt -s nullglob
             for deb in "$pooldir"/*/*/*.deb; do
               dpkg-deb -I "$deb" >/dev/null 2>&1 || continue
@@ -326,8 +332,7 @@ jobs:
                 "$deb" >> "$tsv"
             done
             shopt -u nullglob
-            in_n=$(wc -l < "$tsv")
-            echo ">>> $target/$comp: input=$in_n"
+            in_n=$(wc -l < "$tsv"); echo ">>> $target/$comp: input=$in_n"
             [ "$in_n" -eq 0 ] && continue
             sort -t$'\t' -k1,1 -k2,2rV "$tsv" | awk -F'\t' '!seen[$1]++' > "${tsv}.w"
             placed=0
@@ -335,7 +340,8 @@ jobs:
               [ -z "$pkg" ] && continue
               fname=$(basename "$deb")
               fl=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
-              relpath="${target}/pool/${comp}/${fl}/${pkg}/${fname}"
+              # FIX: Filename relative to sources.list base (no target prefix)
+              relpath="pool/${comp}/${fl}/${pkg}/${fname}"
               size=$(stat -c %s "$deb")
               md5=$(md5sum "$deb" | awk '{print $1}')
               sha1=$(sha1sum "$deb" | awk '{print $1}')
@@ -367,8 +373,7 @@ jobs:
               for comp_dir in "$dist_dir"*/; do
                 [ -d "$comp_dir" ] || continue
                 c="$(basename "$comp_dir")"
-                [ -s "$comp_dir/binary-aarch64/Packages" ] && \
-                  comps="${comps}${comps:+ }$c"
+                [ -s "$comp_dir/binary-aarch64/Packages" ] && comps="${comps}${comps:+ }$c"
               done
               [ -z "$comps" ] && continue
               conf="/tmp/rel-${target}-${dist}.conf"
@@ -381,8 +386,7 @@ jobs:
                 echo "APT::FTPArchive::Release::Components \"${comps}\";"
                 echo "APT::FTPArchive::Release::Description \"xodos ${target} (${dist})\";"
               } > "$conf"
-              apt-ftparchive -c "$conf" release "$target/dists/$dist" \
-                > "$target/dists/$dist/Release"
+              apt-ftparchive -c "$conf" release "$target/dists/$dist" > "$target/dists/$dist/Release"
               cp "$target/dists/$dist/Release" "$target/dists/$dist/InRelease"
             done
           done < "$WORK_DIR/targets.txt"
@@ -400,85 +404,63 @@ jobs:
             fi
           done < "$WORK_DIR/targets.txt"
 
-          echo ""
-          echo ">>> dists size: $(du -sh "$BUILD" | awk '{print $1}')"
-          echo ">>> built:   $(wc -l < "$WORK_DIR/targets-built.txt")"
-          echo ">>> missing: $(wc -l < "$WORK_DIR/targets-missing.txt")"
+      - name: Validate .deb before upload
+        run: |
+          set -euo pipefail
+          bad=0; total=0
+          while IFS= read -r -d '' deb; do
+            total=$((total + 1))
+            head=$(head -c 8 "$deb")
+            if [ "$head" != "!<arch>" ]; then
+              echo "::error::NOT A DEB: $deb"; bad=$((bad + 1)); continue
+            fi
+            if ! dpkg-deb -I "$deb" >/dev/null 2>&1; then
+              echo "::error::INVALID: $deb"; bad=$((bad + 1))
+            fi
+          done < <(find /tmp/aptrepo -type f -name '*.deb' -print0 2>/dev/null || true)
+          echo ">>> checked $total, bad=$bad"
+          [ "$bad" -gt 0 ] && { echo "::error::refusing to upload"; exit 1; }
+          echo ">>> all valid"
 
-      # ==================================================================
-      # Upload — uses upload_folder for huggingface_hub>=1.x
-      #         (upload_large_folder was removed in 1.0)
-      # ==================================================================
       - name: Upload to Hugging Face
         run: |
           set -euo pipefail
           cat > /tmp/upload.py << 'PYEOF'
           import os, time
           from huggingface_hub import HfApi
-
           api = HfApi()
           repo = os.environ["HF_REPO"]
           token = os.environ["HF_TOKEN"]
           mode = os.environ["MODE"]
           work = os.environ["WORK_DIR"]
-
           api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True, token=token)
-          print(">>> HF repo:", repo, "| mode:", mode)
-
           built = [l.strip() for l in open(work + "/targets-built.txt") if l.strip()]
-          print(">>> built targets:", built)
 
-          # Version-tolerant upload helper.
-          # 1.x: upload_large_folder removed → use upload_folder (XET handles chunking)
-          # 0.x: upload_large_folder present → use it (no token param, uses env var)
           def upload_folder_any(folder_path, path_in_repo, label):
               if hasattr(api, "upload_large_folder"):
-                  print(f"    [{label}] HfApi.upload_large_folder")
                   os.environ["HF_TOKEN"] = token
-                  api.upload_large_folder(
-                      folder_path=folder_path,
-                      repo_id=repo,
-                      repo_type="dataset",
-                      path_in_repo=path_in_repo,
-                      num_workers=4,
-                  )
+                  api.upload_large_folder(folder_path=folder_path, repo_id=repo,
+                      repo_type="dataset", path_in_repo=path_in_repo, num_workers=4)
               else:
-                  print(f"    [{label}] HfApi.upload_folder")
-                  api.upload_folder(
-                      folder_path=folder_path,
-                      repo_id=repo,
-                      repo_type="dataset",
-                      path_in_repo=path_in_repo,
-                      token=token,
-                      commit_message=f"Upload {path_in_repo}",
-                  )
+                  api.upload_folder(folder_path=folder_path, repo_id=repo,
+                      repo_type="dataset", path_in_repo=path_in_repo, token=token)
 
           def with_retry(fn, label):
               for attempt in range(1, 6):
-                  try:
-                      fn()
-                      return
+                  try: fn(); return
                   except Exception as e:
                       msg = str(e)
-                      if "429" in msg or "Too Many Requests" in msg or "rate limit" in msg.lower():
-                          sleep_s = attempt * 60
-                          print(f">>> {label}: rate limited (attempt {attempt}/5), sleeping {sleep_s}s")
-                          time.sleep(sleep_s)
+                      if "429" in msg or "rate limit" in msg.lower():
+                          time.sleep(attempt * 60)
                       else:
                           raise
-              raise SystemExit(f"::error::{label} failed after 5 attempts")
+              raise SystemExit(f"::error::{label} failed")
 
           if mode == "pool-only":
               for t in built:
-                  local_pool = "/tmp/pool-tree/" + t + "/pool"
-                  if not os.path.isdir(local_pool):
-                      print(">>> skip pool", t)
-                      continue
-                  print(">>> uploading", t + "/pool/ ...")
-                  with_retry(lambda t=t, local_pool=local_pool: upload_folder_any(
-                      local_pool, t + "/pool", f"pool {t}"
-                  ), f"pool upload {t}")
-                  print(">>> uploaded", t + "/pool/")
+                  lp = "/tmp/pool-tree/" + t + "/pool"
+                  if os.path.isdir(lp):
+                      with_retry(lambda t=t, lp=lp: upload_folder_any(lp, t + "/pool", f"pool {t}"), f"pool {t}")
               raise SystemExit(0)
 
           for t in built:
@@ -487,31 +469,22 @@ jobs:
                                    delete_patterns=[t + "/dists/**"], token=token)
                   print(">>> cleared", t + "/dists/**")
               except Exception as e:
-                  print(">>> WARN clear", t, type(e).__name__, e)
+                  print(">>> WARN clear", t, type(e).__name__)
 
           if mode == "full":
               for t in built:
-                  local_pool = "/tmp/pool-tree/" + t + "/pool"
-                  if not os.path.isdir(local_pool):
-                      print(">>> skip pool", t)
-                      continue
-                  print(">>> uploading", t + "/pool/ ...")
-                  with_retry(lambda t=t, local_pool=local_pool: upload_folder_any(
-                      local_pool, t + "/pool", f"pool {t}"
-                  ), f"pool upload {t}")
-                  print(">>> uploaded", t + "/pool/")
+                  lp = "/tmp/pool-tree/" + t + "/pool"
+                  if os.path.isdir(lp):
+                      print(">>> uploading", t + "/pool/ ...")
+                      with_retry(lambda t=t, lp=lp: upload_folder_any(lp, t + "/pool", f"pool {t}"), f"pool {t}")
+                      print(">>> uploaded", t + "/pool/")
 
           for t in built:
-              local_dists = "/tmp/aptrepo/" + t + "/dists"
-              if not os.path.isdir(local_dists):
-                  print(">>> skip dists", t)
-                  continue
-              print(">>> uploading", t + "/dists/ ...")
-              with_retry(lambda t=t, local_dists=local_dists: upload_folder_any(
-                  local_dists, t + "/dists", f"dists {t}"
-              ), f"dists upload {t}")
-              print(">>> uploaded", t + "/dists/")
-          print(">>> done")
+              ld = "/tmp/aptrepo/" + t + "/dists"
+              if os.path.isdir(ld):
+                  print(">>> uploading", t + "/dists/ ...")
+                  with_retry(lambda t=t, ld=ld: upload_folder_any(ld, t + "/dists", f"dists {t}"), f"dists {t}")
+                  print(">>> uploaded", t + "/dists/")
           PYEOF
           python3 /tmp/upload.py
 
@@ -523,8 +496,7 @@ jobs:
           while read -r target dist comp; do
             [ -z "$target" ] && continue
             if ! grep -qx "$target" "$WORK_DIR/targets-built.txt"; then
-              echo "  SKIP  $target (not built this run)"
-              continue
+              echo "  SKIP  $target"; continue
             fi
             for f in "Release" "InRelease" "${comp}/binary-aarch64/Packages.gz"; do
               url="${base}/${target}/dists/${dist}/${f}?t=$(date +%s)"
@@ -533,46 +505,19 @@ jobs:
               [ "$code" = "200" ] || fail=$((fail+1))
             done
           done < "$WORK_DIR/dist-comp.txt"
-          if [ "$fail" -gt 0 ]; then
-            echo "::error::$fail URLs unreachable"
-            exit 1
-          fi
+
+          # CRITICAL: verify a sample Filename actually resolves
+          echo ""
+          echo ">>> sample .deb URL sanity check:"
+          for target in $(cat "$WORK_DIR/targets-built.txt"); do
+            sample=$(find "/tmp/aptrepo/$target" -name Packages | head -1)
+            [ -z "$sample" ] && continue
+            fname=$(grep '^Filename:' "$sample" | head -1 | sed 's/^Filename: //')
+            url="${base}/${target}/${fname}"
+            code=$(curl -sL -o /dev/null -w "%{http_code}" "$url")
+            printf '  %s  %s/%s\n' "$code" "$target" "$fname"
+            [ "$code" = "200" ] || fail=$((fail+1))
+          done
+
+          [ "$fail" -gt 0 ] && { echo "::error::$fail URLs unreachable"; exit 1; }
           echo ">>> all URLs OK"
-
-      - name: Report missing targets
-        if: always()
-        run: |
-          set -euo pipefail
-          if [ ! -s "$WORK_DIR/targets-missing.txt" ]; then
-            echo ">>> all selected targets built successfully"
-            exit 0
-          fi
-          echo "::error::The following targets had no pool data:"
-          while read -r t; do
-            [ -z "$t" ] && continue
-            echo "::error::    $t"
-          done < "$WORK_DIR/targets-missing.txt"
-          exit 1
-
-      - name: Summary
-        run: |
-          {
-            echo "## APT Repository Regenerated"
-            echo ""
-            echo "**Mode:** \`${{ inputs.mode }}\`"
-            echo "**Repos:** \`${{ inputs.repos }}\`"
-            echo "**clean_hf:** \`${{ inputs.clean_hf }}\`"
-            echo "**huggingface_hub:** $(python3 -c 'import huggingface_hub; print(huggingface_hub.__version__)')"
-            echo ""
-            echo "### Targets built this run"
-            echo '```'
-            cat "$WORK_DIR/targets-built.txt" 2>/dev/null || echo "(none)"
-            echo '```'
-            if [ -s "$WORK_DIR/targets-missing.txt" ]; then
-              echo ""
-              echo "### Targets with no pool data (not built)"
-              echo '```'
-              cat "$WORK_DIR/targets-missing.txt"
-              echo '```'
-            fi
-          } >> $GITHUB_STEP_SUMMARY

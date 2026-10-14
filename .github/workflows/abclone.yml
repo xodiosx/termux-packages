@@ -16,7 +16,7 @@ on:
         required: false
         default: "0"
       skip:
-        description: "Space-separated repos to skip (main x11 root glibc)"
+        description: "Space-separated repos to skip (main x11 root tur tur-on-device tur-continuous)"
         required: false
         default: ""
       workers:
@@ -56,10 +56,16 @@ jobs:
       max-parallel: 2
       matrix:
         include:
-          - { name: main,  url: "https://packages-cf.termux.dev/apt/termux-main/pool/main/",    release_prefix: XoDos-main  }
-          - { name: x11,   url: "https://packages-cf.termux.dev/apt/termux-x11/pool/main/",     release_prefix: XoDos-x11   }
-          - { name: root,  url: "https://packages-cf.termux.dev/apt/termux-root/pool/stable/",  release_prefix: XoDos-root  }
-          - { name: glibc, url: "https://packages-cf.termux.dev/apt/termux-glibc/pool/stable/", release_prefix: XoDos-glibc }
+          - { name: main,           url: "https://packages-cf.termux.dev/apt/termux-main/pool/main/",   release_prefix: XoDos-main  }
+          - { name: x11,            url: "https://packages-cf.termux.dev/apt/termux-x11/pool/main/",    release_prefix: XoDos-x11   }
+          - { name: root,           url: "https://packages-cf.termux.dev/apt/termux-root/pool/stable/", release_prefix: XoDos-root  }
+          # TUR uses Debian-style layout: base = tur.kcubeterm.com, component = tur/tur-on-device/tur-continuous
+          # Verified layout (run `curl -sI <url>` first if unsure):
+          - { name: tur,            url: "https://tur.kcubeterm.com/pool/tur/",             release_prefix: XoDos-tur            }
+          - { name: tur-on-device,  url: "https://tur.kcubeterm.com/pool/tur-on-device/",   release_prefix: XoDos-tur-on-device  }
+          - { name: tur-continuous, url: "https://tur.kcubeterm.com/pool/tur-continuous/",  release_prefix: XoDos-tur-continuous }
+          # To add glibc, provide a working pool URL (Termux CDN does not host one):
+          # - { name: glibc,        url: "https://<your-glibc-mirror>/pool/stable/",        release_prefix: XoDos-glibc         }
 
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -95,6 +101,17 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq binutils xz-utils zstd dpkg-dev perl curl ca-certificates
+
+      - name: Verify pool URL is reachable
+        if: steps.skipcheck.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "${SRC_URL}" || echo "000")
+          echo ">>> ${SRC_URL} -> HTTP ${code}"
+          if [ "$code" != "200" ]; then
+            echo "::error::Pool URL returned HTTP ${code} — check the matrix entry for '$REPO_NAME'"
+            exit 1
+          fi
 
       - name: Disk space (pre)
         if: steps.skipcheck.outputs.skip == 'false'
@@ -178,18 +195,11 @@ jobs:
           fi
 
           # ---------------- ARCH FILTER ----------------
-          # ARCH_IN is a space-separated list, e.g.:
-          #   "aarch64"           → keep _aarch64.deb + _all.deb
-          #   "aarch64 arm"       → keep _aarch64.deb + _arm.deb + _all.deb
-          #   "all"               → keep only _all.deb
-          #   ""  (empty)         → keep everything
-          :
           if [ -z "${ARCH_IN// /}" ]; then
             echo ">>> arch filter: none (all archs)"
             cp work/deblist-all.txt work/deblist.txt
           else
             echo ">>> arch filter: [$ARCH_IN]"
-            # build alternation for the requested archs
             alt=""
             need_all=1
             for a in $ARCH_IN; do
@@ -197,7 +207,6 @@ jobs:
               if [ -z "$alt" ]; then alt="$a"; else alt="$alt|$a"; fi
             done
             [ "$need_all" = "1" ] && alt="$alt|all"
-            # match on "_<arch>.deb$" for the trailing filename segment
             grep -E "_(${alt})\.deb$" work/deblist-all.txt > work/deblist.txt || true
           fi
 
@@ -231,14 +240,6 @@ jobs:
           : > work/failures.log
           : > work/outcomes.log
 
-          # ----------------------------------------------------------
-          # PATCHER — permissive chain:
-          #   1) normal repack
-          #   2) gzip repack
-          #   3) no --root-owner-group
-          #   4) strip all conffiles, repack
-          #   5) ship original .deb untouched (marked UNPATCHED)
-          # ----------------------------------------------------------
           cat > /tmp/patch_one.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -272,11 +273,11 @@ jobs:
             exit 0
           fi
 
-          # rename prefix tree
+          # 1) Rename the top-level data directory
           [ -d "$tmp/data/data/com.termux" ] && \
             mv "$tmp/data/data/com.termux" "$tmp/data/data/app.xodos2"
 
-          # fix symlink targets
+          # 2) Rewrite symlink targets
           while IFS= read -r -d '' link; do
             t="$(readlink "$link" 2>/dev/null || true)"
             case "$t" in
@@ -284,12 +285,20 @@ jobs:
             esac
           done < <(find "$tmp" -type l -print0 2>/dev/null || true)
 
-          # binary-safe content patch
-          find "$tmp" -type f -print0 2>/dev/null \
-            | xargs -0 -r -n 40 perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' 2>/dev/null \
-            || true
+          # 3) Byte-level string replacement.
+          #    - Skip already-compressed blobs (their CRC32 would break).
+          #    - Only touch files that actually contain the pattern.
+          #    - Both strings are 10 bytes, so ELF offsets stay valid.
+          while IFS= read -r -d '' f; do
+            case "$f" in
+              *.gz|*.xz|*.zst|*.bz2|*.lz4|*.lzma|*.zip|*.jar|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico) continue ;;
+            esac
+            if grep -qa 'com\.termux' "$f" 2>/dev/null; then
+              perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' "$f" 2>/dev/null || true
+            fi
+          done < <(find "$tmp" -type f -print0 2>/dev/null || true)
 
-          # DEBIAN/ modes
+          # 4) Restore maintainer script permissions
           if [ -d "$tmp/DEBIAN" ]; then
             for s in preinst postinst prerm postrm config; do
               [ -f "$tmp/DEBIAN/$s" ] && chmod 0755 "$tmp/DEBIAN/$s" || true
@@ -299,7 +308,7 @@ jobs:
             done
           fi
 
-          # filter non-existent conffiles
+          # 5) Drop conffiles entries pointing at non-existent files
           if [ -f "$tmp/DEBIAN/conffiles" ]; then
             : > "$tmp/DEBIAN/conffiles.new"
             while IFS= read -r line || [ -n "$line" ]; do
@@ -315,7 +324,7 @@ jobs:
             mv "$tmp/DEBIAN/conffiles.new" "$tmp/DEBIAN/conffiles"
           fi
 
-          # traversable dirs
+          # 6) Ensure u+rwx on data dirs so dpkg-deb --root-owner-group can read
           find "$tmp/data" -type d -print0 2>/dev/null \
             | while IFS= read -r -d '' d; do
                 cur="$(stat -c '%a' "$d" 2>/dev/null || echo 755)"
@@ -324,28 +333,25 @@ jobs:
                 fi
               done
 
-          # attempt 1: normal
+          # 7) Try several pack strategies
           if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then
             echo "OK"
             exit 0
           fi
           rm -f "$dst"
 
-          # attempt 2: gzip
           if dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$dst" >/dev/null 2>&1; then
             echo "OK-FALLBACK-GZIP"
             exit 0
           fi
           rm -f "$dst"
 
-          # attempt 3: no --root-owner-group
           if dpkg-deb -b "$tmp" "$dst" >/dev/null 2>&1; then
             echo "OK-FALLBACK-NOROG"
             exit 0
           fi
           rm -f "$dst"
 
-          # attempt 4: empty conffiles
           if [ -f "$tmp/DEBIAN/conffiles" ]; then
             : > "$tmp/DEBIAN/conffiles"
             if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then
@@ -355,14 +361,12 @@ jobs:
             rm -f "$dst"
           fi
 
-          # attempt 5: ship original unpatched
           cp -a "$src" "$dst"
           echo "UNPATCHED-COPIED"
           exit 0
           EOS
           chmod +x /tmp/patch_one.sh
 
-          # ---------- worker ----------
           cat > /tmp/dl_and_patch.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -493,7 +497,7 @@ jobs:
           for d in chunks/part*; do
             part="${d##*part}"
             tag="${PFX}-${REL_PREFIX}-p${part}-${TS}"
-            title="XoDos ${REPO_NAME} (part ${part}/${nchunks}) — ${TS}"
+            title="XoDos ${REPO_NAME} (part${part}/${nchunks}) — ${TS}"
 
             cat > /tmp/notes.md <<EOF
           Patched Termux \`.deb\` packages for **${REPO_NAME}**.
@@ -502,7 +506,8 @@ jobs:
           - Architecture filter: \`${ARCH_LABEL}\`
           - Prefix patch: \`/data/data/com.termux\` → \`/data/data/app.xodos2\`
             (tree, symlink targets, and file contents via binary-safe
-            \`perl -0777\`; both strings are 10 bytes so ELF offsets are preserved)
+            \`perl -0777\`; both strings are 10 bytes so ELF offsets are preserved;
+            compressed blobs are skipped to avoid CRC corruption)
           - Maintainer script permissions restored to 0755
           - Non-existent conffiles entries filtered
           - Repacked with \`dpkg-deb --root-owner-group -b\`

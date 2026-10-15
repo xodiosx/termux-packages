@@ -10,7 +10,7 @@ on:
       repos:
         description: "Repos to check (comma-separated)"
         required: true
-        default: "main,x11,root"
+        default: "main,x11,root,glibc,tur,tur-on-device,tur-continuous"
       arch:
         description: "Architecture"
         required: false
@@ -55,12 +55,16 @@ jobs:
 
       # ==================================================================
       # 1. Map repo names to Packages URLs + base URLs
+      #    - glibc uses dists/glibc/stable/binary-aarch64/Packages
+      #    - TUR uses dists/tur-packages/<component>/binary-aarch64/Packages
+      #      and its .deb files are absolute URLs on GitHub Releases
       # ==================================================================
       - name: Compute repo URLs
         run: |
           set -euo pipefail
           mkdir -p work
           : > work/repo-urls.txt
+
           for r in $(echo "$REPOS_IN" | tr ',' ' '); do
             r=$(echo "$r" | tr -d ' ')
             [ -z "$r" ] && continue
@@ -72,7 +76,8 @@ jobs:
               root)
                 printf 'root\thttps://packages-cf.termux.dev/apt/termux-root/dists/root/stable/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-root\n' >> work/repo-urls.txt ;;
               glibc)
-                printf 'glibc\thttps://packages-cf.termux.dev/apt/termux-glibc/dists/glibc/main/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-glibc\n' >> work/repo-urls.txt ;;
+                # FIXED: glibc Packages path is dists/glibc/stable/binary-aarch64/Packages
+                printf 'glibc\thttps://packages-cf.termux.dev/apt/termux-glibc/dists/glibc/stable/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-glibc\n' >> work/repo-urls.txt ;;
               tur)
                 printf 'tur\thttps://tur.kcubeterm.com/dists/tur-packages/tur/binary-aarch64/Packages\thttps://tur.kcubeterm.com\n' >> work/repo-urls.txt ;;
               tur-on-device)
@@ -82,12 +87,16 @@ jobs:
               *) echo "::warning::Unknown repo: $r" ;;
             esac
           done
+
           echo ">>> Repos to process:"
           awk -F'\t' '{print "    " $1}' work/repo-urls.txt
 
       # ==================================================================
       # 2. For each repo: fetch official Packages, list existing assets,
       #    compute the diff.
+      #    - Only entries with a non-empty Filename: are considered "real"
+      #      packages. Meta-packages and virtual packages (no Filename:)
+      #      are automatically excluded from the diff.
       # ==================================================================
       - name: Compute per-repo diffs
         run: |
@@ -120,7 +129,8 @@ jobs:
               continue
             fi
 
-            # Extract every Package: block with its Filename: and build absolute URL.
+            # Extract every Package: block that has BOTH Package: and Filename:.
+            # Meta-packages (only Depends:, no Filename:) are skipped.
             # Only keep _aarch64.deb and _all.deb entries.
             awk -v base="$base_url" '
               BEGIN { pkg=""; fname="" }
@@ -130,7 +140,12 @@ jobs:
                 if (pkg != "" && fname != "") {
                   if (fname ~ /_aarch64\.deb$/ || fname ~ /_all\.deb$/) {
                     gsub(/\/$/, "", base)
-                    print pkg "\t" base "/" fname
+                    # Handle absolute URLs (TUR) vs relative paths (Termux)
+                    if (fname ~ /^https?:\/\//) {
+                      print pkg "\t" fname
+                    } else {
+                      print pkg "\t" base "/" fname
+                    }
                   }
                 }
                 pkg=""; fname=""
@@ -139,7 +154,11 @@ jobs:
                 if (pkg != "" && fname != "") {
                   if (fname ~ /_aarch64\.deb$/ || fname ~ /_all\.deb$/) {
                     gsub(/\/$/, "", base)
-                    print pkg "\t" base "/" fname
+                    if (fname ~ /^https?:\/\//) {
+                      print pkg "\t" fname
+                    } else {
+                      print pkg "\t" base "/" fname
+                    }
                   }
                 }
               }

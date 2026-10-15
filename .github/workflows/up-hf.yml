@@ -27,14 +27,6 @@ on:
         description: "Part number for the fix release (default p99)"
         required: false
         default: "p99"
-      dists_fallback_repo:
-        description: "GitHub repo holding dists fallback release assets"
-        required: false
-        default: "termux-user-repository/dists"
-      dists_fallback_tag:
-        description: "Release tag in the dists fallback repo"
-        required: false
-        default: "0.1"
 
 permissions:
   contents: write
@@ -54,8 +46,6 @@ jobs:
       DRY_RUN: ${{ inputs.dry_run }}
       MAX_PER_REPO: ${{ inputs.max_per_repo }}
       UPLOAD_SUFFIX: ${{ inputs.upload_tag_suffix }}
-      DISTS_REPO: ${{ inputs.dists_fallback_repo }}
-      DISTS_TAG: ${{ inputs.dists_fallback_tag }}
 
     steps:
       - name: Install tools
@@ -85,22 +75,16 @@ jobs:
           echo ">>> Repos to process:"
           awk -F'\t' '{print "    " $1}' work/repo-urls.txt
 
-      # ── NEW: prefetch the dists release asset list once ──
-      - name: Fetch dists fallback assets
+      - name: Prefetch main Termux Packages (for fallback)
         run: |
           set -euo pipefail
           mkdir -p work
-          echo ">>> fetching fallback assets from $DISTS_REPO @ $DISTS_TAG"
-          if gh release view "$DISTS_TAG" --repo "$DISTS_REPO" --json assets \
-               --jq '.assets[].name' > work/dists-assets.txt 2>/dev/null; then
-            n=$(wc -l < work/dists-assets.txt)
-            echo ">>>   fallback assets available: $n"
-            head -5 work/dists-assets.txt | sed 's/^/    /'
-          else
-            echo "::warning::could not fetch fallback assets from $DISTS_REPO — fallback disabled"
-            : > work/dists-assets.txt
-          fi
-      # ──────────────────────────────────────────────────────
+          MAIN_PKGS="https://packages-cf.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages"
+          echo ">>> prefetching main Termux Packages for fallback"
+          curl -fsSL --retry 4 --retry-delay 2 --max-time 180 \
+            -o work/Packages-main "$MAIN_PKGS" \
+            || { echo "::warning::could not prefetch main Packages — fallback disabled"; : > work/Packages-main; }
+          echo ">>> main Packages size: $(wc -c < work/Packages-main) bytes"
 
       - name: Compute per-repo diffs
         run: |
@@ -324,7 +308,6 @@ jobs:
           EOS
           chmod +x /tmp/patch_one.sh
 
-          # ── MODIFIED: try primary URL, then fall back to the dists GitHub release ──
           cat > /tmp/dl_and_patch.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -342,34 +325,52 @@ jobs:
 
           enc="$(basename "$url")"
           fn="$(printf '%s' "$enc" | perl -pe 's/%([0-9A-Fa-f]{2})/chr(hex($1))/ge')"
-          tmpfile="work/tmp/$fn"
-          outfile="$outdir/$fn"
+          # GitHub release asset names cannot contain ':' — replace with '.'
+          safe_fn="${fn//:/.}"
+          tmpfile="work/tmp/$safe_fn"
+          outfile="$outdir/$safe_fn"
 
           [ -s "$outfile" ] && exit 0
 
-          assets_file="${GITHUB_WORKSPACE:-$PWD}/work/dists-assets.txt"
           dl_ok=0
 
-          # 1) primary URL from the Packages index
+          # ── Tier 1: primary TUR URL ──
           if curl -fsSL --retry 3 --retry-delay 2 --max-time 600 \
                -o "$tmpfile" "$url" 2>/tmp/curl-err.$$; then
             dl_ok=1
           else
-            # 2) fallback: match the asset in the dists GitHub release.
-            #    Index filenames use epoch ':' but GitHub asset names use '.'
-            #    (colons aren't allowed in release asset filenames).
-            if [ -s "$assets_file" ]; then
-              gh_name="${fn//:/.}"
-              if grep -Fxq "$gh_name" "$assets_file"; then
-                fb_url="https://github.com/${DISTS_REPO}/releases/download/${DISTS_TAG}/${gh_name}"
-                echo ">>> FALLBACK $repo: $fn -> $gh_name" >&2
+            echo ">>> TUR 404 for $fn — trying main-Termux fallback" >&2
+
+            # ── Tier 2: main Termux repo ──
+            # Extract the bare package name from the TUR filename
+            pkg_name="$(printf '%s' "$fn" | sed -E 's/_[0-9].*$//')"
+            main_pkgs="${GITHUB_WORKSPACE:-$PWD}/work/Packages-main"
+
+            if [ -s "$main_pkgs" ]; then
+              main_fname="$(awk -v want="$pkg_name" '
+                /^Package: /  { pkg  = substr($0, 10) }
+                /^Filename: / { fname = substr($0, 11) }
+                /^$/ {
+                  if (pkg == want && fname != "") { print fname; exit }
+                  pkg=""; fname=""
+                }
+                END {
+                  if (pkg == want && fname != "") print fname
+                }
+              ' "$main_pkgs")"
+
+              if [ -n "$main_fname" ]; then
+                main_url="https://packages-cf.termux.dev/apt/termux-main/${main_fname}"
+                echo ">>> MAIN-FALLBACK $repo: $pkg_name -> $main_url" >&2
                 if curl -fsSL --retry 3 --retry-delay 2 --max-time 600 \
-                     -o "$tmpfile" "$fb_url" 2>/tmp/curl-err2.$$; then
+                     -o "$tmpfile" "$main_url" 2>/tmp/curl-err2.$$; then
                   dl_ok=1
                 fi
               else
-                echo ">>> no fallback asset for $fn" >&2
+                echo ">>> no main-Termux entry for $pkg_name" >&2
               fi
+            else
+              echo ">>> main Packages index not available — fallback skipped" >&2
             fi
           fi
 
@@ -390,7 +391,7 @@ jobs:
           rm -f /tmp/patch-err.$$
           rm -f "$tmpfile"
           [ -z "$outcome" ] && outcome="OK"
-          printf '%s\t%s\t%s\n' "$repo" "$outcome" "$fn" >> work/outcomes.log
+          printf '%s\t%s\t%s\n' "$repo" "$outcome" "$safe_fn" >> work/outcomes.log
           [ ! -s "$outfile" ] && echo "FAIL $repo/$fn" >> work/failures.log
           exit 0
           EOS

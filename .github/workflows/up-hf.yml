@@ -81,7 +81,6 @@ jobs:
           : > work/missing-report.txt
           : > work/missing-urls.txt
 
-          # FIX: fetch ALL tags once, with --paginate --slurp
           echo ">>> fetching all release tags from $SRC_REPO ..."
           gh api --paginate --slurp "repos/$SRC_REPO/releases?per_page=100" \
             | jq -r '.[][] | .tag_name' > work/all-tags.txt
@@ -93,12 +92,10 @@ jobs:
             echo ">>> repo: $repo"
             echo "=================================================="
 
-            # (a) Filter tags for this repo
             grep -E "^xodos-XoDos-${repo}-p[0-9]+-" work/all-tags.txt \
               | sort -u > "work/tags-$repo.txt"
             echo ">>>   tags found for $repo: $(wc -l < "work/tags-$repo.txt")"
 
-            # (b) For each tag, list assets
             : > "work/existing-$repo.txt"
             while IFS= read -r tag; do
               [ -z "$tag" ] && continue
@@ -111,7 +108,6 @@ jobs:
               > "work/existing-pkgs-$repo.txt"
             echo ">>>   existing packages in $repo: $(wc -l < "work/existing-pkgs-$repo.txt")"
 
-            # (c) Fetch official Packages
             echo ">>> fetching official Packages for '$repo'..."
             if ! curl -fsSL --retry 4 --retry-delay 2 --max-time 180 \
                    -o "work/Packages-$repo" "$packages_url"; then
@@ -211,7 +207,7 @@ jobs:
           cat > /tmp/patch_one.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
-          set -x   # verbose
+          set -x
 
           src="$1"; dst="$2"
           tmp="$(mktemp -d)"
@@ -222,7 +218,6 @@ jobs:
             rm -f "$dst"
           fi
 
-          # magic-byte check
           magic="$(head -c 8 "$src")"
           if [ "$magic" != "!<arch>" ]; then
             echo "NOT-A-DEB" >&2
@@ -281,11 +276,15 @@ jobs:
             mv "$tmp/DEBIAN/conffiles.new" "$tmp/DEBIAN/conffiles"
           fi
 
-          find "$tmp/data" -type d -print0 2>/dev/null \
-            | while IFS= read -r -d '' d; do
-                cur="$(stat -c '%a' "$d" 2>/dev/null || echo 755)"
-                if [ $((0$cur & 0700)) -ne 0700 ]; then chmod u+rwx "$d" 2>/dev/null || true; fi
-              done
+          # ── FIX: guard the find when data/ is absent (meta-packages) ──
+          if [ -d "$tmp/data" ]; then
+            find "$tmp/data" -type d -print0 2>/dev/null \
+              | while IFS= read -r -d '' d; do
+                  cur="$(stat -c '%a' "$d" 2>/dev/null || echo 755)"
+                  if [ $((0$cur & 0700)) -ne 0700 ]; then chmod u+rwx "$d" 2>/dev/null || true; fi
+                done
+          fi
+          # ──────────────────────────────────────────────────────────────
 
           if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then echo "OK"; exit 0; fi
           rm -f "$dst"

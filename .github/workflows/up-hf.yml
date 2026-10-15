@@ -1,617 +1,396 @@
-name: generate APT Repo2 on Hugging Face
+name: Fix Missing Packages in GitHub Releases
 
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "Operation mode"
-        required: true
-        type: choice
-        default: metadata-only
-        options:
-          - metadata-only
-          - full
-          - pool-only
-      hf_repo_id:
-        description: "Hugging Face dataset repo (username/repo-name)"
-        required: true
-        default: "xodiosx/xodos-packages"
-      repos:
-        description: "Repos to process (comma-separated)"
-        required: true
-        default: "main,x11,root,glibc,tur,tur-on-device,tur-continuous"
       source_repo:
-        description: "GitHub repo with releases (used in full / pool-only)"
-        required: false
+        description: "GitHub repo hosting releases (owner/name)"
+        required: true
         default: "xodiosx/termux-packages"
-      clean_hf:
-        description: "Wipe the whole HF repo before upload (full mode only)"
+      repos:
+        description: "Repos to check (comma-separated)"
+        required: true
+        default: "main,x11,root"
+      arch:
+        description: "Architecture"
+        required: false
+        default: "aarch64"
+      dry_run:
+        description: "Only report missing packages (no downloads, no uploads)"
         type: boolean
-        default: false
+        default: true
+      max_per_repo:
+        description: "Max missing packages per repo (0 = no limit)"
+        required: false
+        default: "500"
+      upload_tag_suffix:
+        description: "Part number for the fix release (default p99)"
+        required: false
+        default: "p99"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: regenerate-repo
+  group: fix-missing-packages
   cancel-in-progress: false
 
 jobs:
-  regenerate:
+  fix:
     runs-on: ubuntu-24.04
     env:
-      HF_REPO: ${{ inputs.hf_repo_id }}
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      GH_TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SRC_REPO: ${{ inputs.source_repo }}
-      MODE: ${{ inputs.mode }}
       REPOS_IN: ${{ inputs.repos }}
-      CLEAN_HF: ${{ inputs.clean_hf }}
-      HF_HUB_DISABLE_TELEMETRY: "1"
-      WORK_DIR: ${{ github.workspace }}/work
+      ARCH: ${{ inputs.arch }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      MAX_PER_REPO: ${{ inputs.max_per_repo }}
+      UPLOAD_SUFFIX: ${{ inputs.upload_tag_suffix }}
 
     steps:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq dpkg-dev apt-utils gzip jq
-          pip install -q --upgrade "huggingface_hub>=1.29.0"
-          python3 -c "import huggingface_hub; print('huggingface_hub', huggingface_hub.__version__)"
+          sudo apt-get install -y -qq binutils xz-utils zstd dpkg-dev perl curl jq
 
-      - name: Compute targets
+      # ==================================================================
+      # 1. Map repo names to Packages URLs + base URLs
+      # ==================================================================
+      - name: Compute repo URLs
         run: |
           set -euo pipefail
-          mkdir -p "$WORK_DIR"
-          : > "$WORK_DIR/targets.txt"
-          : > "$WORK_DIR/dist-comp.txt"
+          mkdir -p work
+          : > work/repo-urls.txt
           for r in $(echo "$REPOS_IN" | tr ',' ' '); do
             r=$(echo "$r" | tr -d ' ')
             [ -z "$r" ] && continue
             case "$r" in
               main)
-                echo "xodos-main" >> "$WORK_DIR/targets.txt"
-                echo "xodos-main stable main" >> "$WORK_DIR/dist-comp.txt"
-                ;;
+                printf 'main\thttps://packages-cf.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-main\n' >> work/repo-urls.txt ;;
               x11)
-                echo "xodos-x11" >> "$WORK_DIR/targets.txt"
-                echo "xodos-x11 x11 main" >> "$WORK_DIR/dist-comp.txt"
-                ;;
+                printf 'x11\thttps://packages-cf.termux.dev/apt/termux-x11/dists/x11/main/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-x11\n' >> work/repo-urls.txt ;;
               root)
-                echo "xodos-root" >> "$WORK_DIR/targets.txt"
-                echo "xodos-root root stable" >> "$WORK_DIR/dist-comp.txt"
-                ;;
+                printf 'root\thttps://packages-cf.termux.dev/apt/termux-root/dists/root/stable/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-root\n' >> work/repo-urls.txt ;;
               glibc)
-                echo "xodos-glibc" >> "$WORK_DIR/targets.txt"
-                echo "xodos-glibc glibc main" >> "$WORK_DIR/dist-comp.txt"
-                ;;
+                printf 'glibc\thttps://packages-cf.termux.dev/apt/termux-glibc/dists/glibc/main/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-glibc\n' >> work/repo-urls.txt ;;
               tur)
-                echo "xodos-tur" >> "$WORK_DIR/targets.txt"
-                echo "xodos-tur tur-packages tur" >> "$WORK_DIR/dist-comp.txt"
-                ;;
+                printf 'tur\thttps://tur.kcubeterm.com/dists/tur-packages/tur/binary-aarch64/Packages\thttps://tur.kcubeterm.com\n' >> work/repo-urls.txt ;;
               tur-on-device)
-                echo "xodos-tur" >> "$WORK_DIR/targets.txt"
-                echo "xodos-tur tur-packages tur-on-device" >> "$WORK_DIR/dist-comp.txt"
-                ;;
+                printf 'tur-on-device\thttps://tur.kcubeterm.com/dists/tur-packages/tur-on-device/binary-aarch64/Packages\thttps://tur.kcubeterm.com\n' >> work/repo-urls.txt ;;
               tur-continuous)
-                echo "xodos-tur" >> "$WORK_DIR/targets.txt"
-                echo "xodos-tur tur-packages tur-continuous" >> "$WORK_DIR/dist-comp.txt"
-                ;;
-              *) echo "::error::Unknown repo: $r"; exit 1 ;;
+                printf 'tur-continuous\thttps://tur.kcubeterm.com/dists/tur-packages/tur-continuous/binary-aarch64/Packages\thttps://tur.kcubeterm.com\n' >> work/repo-urls.txt ;;
+              *) echo "::warning::Unknown repo: $r" ;;
             esac
           done
-          sort -u "$WORK_DIR/targets.txt" -o "$WORK_DIR/targets.txt"
-          sort -u "$WORK_DIR/dist-comp.txt" -o "$WORK_DIR/dist-comp.txt"
-          echo ">>> Mode: $MODE"
-          echo ">>> Targets:"
-          sed 's/^/    /' "$WORK_DIR/targets.txt"
-          echo ">>> Dist/comp:"
-          sed 's/^/    /' "$WORK_DIR/dist-comp.txt"
-
-      - name: Wipe Hugging Face repo
-        if: ${{ inputs.mode == 'full' && inputs.clean_hf }}
-        run: |
-          set -euo pipefail
-          echo "::warning::clean_hf=true — DELETING entire HF repo"
-          cat > /tmp/wipe.py << 'PYEOF'
-          import os
-          from huggingface_hub import HfApi
-          from huggingface_hub.utils import RepositoryNotFoundError
-          api = HfApi()
-          repo = os.environ["HF_REPO"]
-          token = os.environ["HF_TOKEN"]
-          try:
-              api.delete_repo(repo_id=repo, repo_type="dataset", token=token)
-              print(">>> deleted:", repo)
-          except RepositoryNotFoundError:
-              print(">>> repo did not exist")
-          api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True, token=token)
-          print(">>> recreated empty")
-          PYEOF
-          python3 /tmp/wipe.py
+          echo ">>> Repos to process:"
+          awk -F'\t' '{print "    " $1}' work/repo-urls.txt
 
       # ==================================================================
-      # Download from HF via direct CDN URLs (bypasses snapshot_download)
-      # - 1 list_repo_files call (auto-paginated, ~5 API requests)
-      # - N direct resolve/main/ URL downloads (CDN, no rate limit)
+      # 2. For each repo: fetch official Packages, list existing assets,
+      #    compute the diff.
       # ==================================================================
-      - name: Download .deb from Hugging Face
-        if: ${{ inputs.mode == 'metadata-only' }}
+      - name: Compute per-repo diffs
         run: |
           set -euo pipefail
-          cat > /tmp/dl_hf.py << 'PYEOF'
-          import os, sys, time, urllib.request, urllib.parse, concurrent.futures
-          import pathlib
-          from huggingface_hub import HfApi
+          : > work/missing-report.txt
+          : > work/missing-urls.txt
 
-          repo = os.environ["HF_REPO"]
-          token = os.environ.get("HF_TOKEN")
-          work = os.environ["WORK_DIR"]
+          while IFS=$'\t' read -r repo packages_url base_url; do
+            [ -z "$repo" ] && continue
+            echo "=================================================="
+            echo ">>> repo: $repo"
+            echo "=================================================="
 
-          targets = [l.strip() for l in open(work + "/targets.txt") if l.strip()]
-          print(">>> targets:", targets)
+            # --- (a) existing assets in XoDos releases for THIS repo only ---
+            echo ">>> listing existing XoDos assets for '$repo'..."
+            gh api "repos/$SRC_REPO/releases?per_page=100" --paginate \
+              --jq ".[] | select(.tag_name | test(\"^xodos-XoDos-${repo}-p[0-9]+-\")) | .assets[]?.name" \
+              > "work/existing-$repo.txt" 2>/dev/null || true
 
-          api = HfApi()
-          print(">>> listing repo files (auto-paginated)...")
-          all_files = list(api.list_repo_files(
-              repo_id=repo, repo_type="dataset", token=token,
-          ))
-          print(f">>> total files on HF: {len(all_files)}")
+            # Debian filename convention: <pkg>_<version>_<arch>.deb
+            awk -F'_' 'NF>=3 {print $1}' "work/existing-$repo.txt" | sort -u \
+              > "work/existing-pkgs-$repo.txt"
+            echo ">>>   existing packages in $repo: $(wc -l < "work/existing-pkgs-$repo.txt")"
 
-          prefixes = tuple(f"{t}/pool/" for t in targets)
-          selected = [
-              f for f in all_files
-              if f.endswith(".deb") and any(f.startswith(p) for p in prefixes)
-          ]
-          print(f">>> matching .deb: {len(selected)}")
-          if not selected:
-              raise SystemExit("::error::no matching .deb files found on HF")
+            # --- (b) official Packages index ---
+            echo ">>> fetching official Packages for '$repo'..."
+            if ! curl -fsSL --retry 4 --retry-delay 2 --max-time 180 \
+                   -o "work/Packages-$repo" "$packages_url"; then
+              echo ">>> WARN: cannot fetch $packages_url — skipping $repo"
+              continue
+            fi
 
-          BASE = f"https://huggingface.co/datasets/{repo}/resolve/main/"
-          DEST = pathlib.Path("/tmp/hf-debs")
+            # Extract every Package: block with its Filename: and build absolute URL.
+            # Only keep _aarch64.deb and _all.deb entries.
+            awk -v base="$base_url" '
+              BEGIN { pkg=""; fname="" }
+              /^Package: /  { pkg = substr($0, 10) }
+              /^Filename: / { fname = substr($0, 11) }
+              /^$/ {
+                if (pkg != "" && fname != "") {
+                  if (fname ~ /_aarch64\.deb$/ || fname ~ /_all\.deb$/) {
+                    gsub(/\/$/, "", base)
+                    print pkg "\t" base "/" fname
+                  }
+                }
+                pkg=""; fname=""
+              }
+              END {
+                if (pkg != "" && fname != "") {
+                  if (fname ~ /_aarch64\.deb$/ || fname ~ /_all\.deb$/) {
+                    gsub(/\/$/, "", base)
+                    print pkg "\t" base "/" fname
+                  }
+                }
+              }
+            ' "work/Packages-$repo" > "work/official-$repo.txt"
 
-          headers = {"User-Agent": "xodos-pkg-sync/1.0"}
-          if token:
-              headers["Authorization"] = f"Bearer {token}"
+            awk -F'\t' '{print $1}' "work/official-$repo.txt" | sort -u \
+              > "work/official-pkgs-$repo.txt"
+            echo ">>>   official packages in $repo: $(wc -l < "work/official-pkgs-$repo.txt")"
 
-          def fetch(rel):
-              url = BASE + urllib.parse.quote(rel, safe="/")
-              out = DEST / rel
-              out.parent.mkdir(parents=True, exist_ok=True)
-              if out.exists() and out.stat().st_size > 0:
-                  return ("cached", rel)
-              for attempt in range(1, 7):
-                  req = urllib.request.Request(url, headers=headers)
-                  try:
-                      with urllib.request.urlopen(req, timeout=180) as r, open(out, "wb") as f:
-                          while True:
-                              chunk = r.read(1024 * 1024)
-                              if not chunk:
-                                  break
-                              f.write(chunk)
-                      return ("ok", rel)
-                  except Exception as e:
-                      msg = str(e)
-                      if "429" in msg or "Too Many Requests" in msg:
-                          sleep_s = attempt * 5
-                          time.sleep(sleep_s)
-                      else:
-                          if out.exists():
-                              out.unlink()
-                          return ("fail", rel, msg[:200])
-              if out.exists():
-                  out.unlink()
-              return ("fail", rel, "gave up after retries")
+            # --- (c) diff: official − existing ---
+            comm -23 "work/official-pkgs-$repo.txt" "work/existing-pkgs-$repo.txt" \
+              > "work/missing-$repo.txt"
 
-          ok = cached = fail = 0
-          failed = []
-          total = len(selected)
-          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-              for kind, rel, *rest in ex.map(fetch, selected):
-                  if kind == "ok":
-                      ok += 1
-                  elif kind == "cached":
-                      cached += 1
-                  else:
-                      fail += 1
-                      failed.append((rel, rest[0] if rest else "?"))
-                  done = ok + cached + fail
-                  if done % 200 == 0 or done == total:
-                      print(f">>> {done}/{total}  ok={ok} cached={cached} fail={fail}")
+            missing_count=$(wc -l < "work/missing-$repo.txt")
+            echo ">>>   MISSING in $repo: $missing_count"
 
-          print(f">>> finished: ok={ok} cached={cached} fail={fail}")
-          for rel, err in failed[:20]:
-              print("    FAIL", rel, "—", err)
-          if fail > 0:
-              print(f"::warning::{fail} file(s) failed")
-          if ok + cached == 0:
-              sys.exit("::error::nothing downloaded")
-          PYEOF
-          python3 /tmp/dl_hf.py
-          n=$(find /tmp/hf-debs -type f -name '*.deb' | wc -l)
-          echo ">>> total .deb in /tmp/hf-debs: $n"
-          du -sh /tmp/hf-debs 2>/dev/null || true
+            if [ "$missing_count" -eq 0 ]; then
+              echo ""
+              echo "### $repo — ✅ nothing missing" >> work/missing-report.txt
+              continue
+            fi
 
-      - name: Download .deb from GitHub Releases
-        if: ${{ inputs.mode != 'metadata-only' }}
+            {
+              echo ""
+              echo "### $repo — ❌ $missing_count missing packages"
+              head -60 "work/missing-$repo.txt" | sed 's/^/    /'
+              if [ "$missing_count" -gt 60 ]; then
+                echo "    ... and $((missing_count - 60)) more"
+              fi
+            } >> work/missing-report.txt
+
+            # --- (d) collect URLs for missing packages ---
+            awk -F'\t' 'NR==FNR { want[$1]=1; next } want[$1] { print $2 }' \
+              "work/missing-$repo.txt" "work/official-$repo.txt" \
+              > "work/missing-urls-$repo.txt"
+
+            if [ "$MAX_PER_REPO" != "0" ]; then
+              head -n "$MAX_PER_REPO" "work/missing-urls-$repo.txt" > /tmp/lim.txt
+              mv /tmp/lim.txt "work/missing-urls-$repo.txt"
+            fi
+
+            echo ">>>   URLs to fetch: $(wc -l < "work/missing-urls-$repo.txt")"
+            awk -v r="$repo" '{print r "\t" $0}' "work/missing-urls-$repo.txt" \
+              >> work/missing-urls.txt
+
+          done < work/repo-urls.txt
+
+          echo ""
+          echo "=================================================="
+          echo ">>> TOTAL URLs queued for patching: $(wc -l < work/missing-urls.txt)"
+          echo "=================================================="
+
+      - name: Show report
         run: |
           set -euo pipefail
-          rm -rf /tmp/gh-debs
-          mkdir -p /tmp/gh-debs
-          download_tag() {
-            local tag="$1" dest="$2"
-            local attempt=1
-            while [ "$attempt" -le 6 ]; do
-              if gh release download "$tag" --repo "$SRC_REPO" \
-                   --pattern "*.deb" --dir "$dest" 2>/tmp/gh_err.log; then
-                return 0
-              fi
-              if grep -qiE 'rate limit|403|429|secondary' /tmp/gh_err.log; then
-                echo "        rate limited (attempt $attempt/6), sleeping $((attempt*60))s"
-                sleep $((attempt*60))
-              else
-                echo "        error (attempt $attempt/6), sleeping $((attempt*10))s"
-                head -2 /tmp/gh_err.log | sed 's/^/            /' || true
-                sleep $((attempt*10))
-              fi
-              attempt=$((attempt+1))
+          echo "===================================================================="
+          echo ">>> MISSING PACKAGES REPORT"
+          echo "===================================================================="
+          cat work/missing-report.txt
+          echo ""
+          echo "===================================================================="
+          echo ">>> DRY_RUN = $DRY_RUN"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo ">>> This was a report-only run. No downloads, no uploads."
+            echo ">>> Re-run with dry_run=false to fetch and patch the missing packages."
+          fi
+          echo "===================================================================="
+
+      # ==================================================================
+      # 3. Download + patch only the missing packages
+      # ==================================================================
+      - name: Download and patch
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          set -euo pipefail
+          mkdir -p work/patched work/tmp
+          : > work/failures.log
+          : > work/outcomes.log
+
+          cat > /tmp/patch_one.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          src="$1"; dst="$2"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          if [ -e "$dst" ]; then
+            if dpkg-deb -I "$dst" >/dev/null 2>&1; then echo "OK-CACHED"; exit 0; fi
+            rm -f "$dst"
+          fi
+          if ! dpkg-deb -R "$src" "$tmp" 2>/dev/null; then
+            cp -a "$src" "$dst"; echo "FAIL-EXTRACT"; exit 0
+          fi
+          [ -d "$tmp/data/data/com.termux" ] && mv "$tmp/data/data/com.termux" "$tmp/data/data/app.xodos2"
+          while IFS= read -r -d '' link; do
+            t="$(readlink "$link" 2>/dev/null || true)"
+            case "$t" in *com.termux*) ln -sfn "${t//com.termux/app.xodos2}" "$link" || true ;; esac
+          done < <(find "$tmp" -type l -print0 2>/dev/null || true)
+          while IFS= read -r -d '' f; do
+            case "$f" in
+              *.gz|*.xz|*.zst|*.bz2|*.lz4|*.lzma|*.zip|*.jar|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico) continue ;;
+            esac
+            if grep -qa 'com\.termux' "$f" 2>/dev/null; then
+              perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' "$f" 2>/dev/null || true
+            fi
+          done < <(find "$tmp" -type f -print0 2>/dev/null || true)
+          if [ -d "$tmp/DEBIAN" ]; then
+            for s in preinst postinst prerm postrm config; do
+              [ -f "$tmp/DEBIAN/$s" ] && chmod 0755 "$tmp/DEBIAN/$s" || true
             done
-            return 1
-          }
-          failed=""
-          mapfile -t TAGS < <(
-            gh release list --repo "$SRC_REPO" --limit 1000 \
-              --json tagName,createdAt \
-              --jq 'sort_by(.createdAt) | .[].tagName | select(startswith("xodos-XoDos-"))'
-          )
-          : > "$WORK_DIR/tags-for-run.txt"
-          for tag in "${TAGS[@]}"; do
-            for target in $(cat "$WORK_DIR/targets.txt"); do
-              short="${target#xodos-}"
-              case "$short" in
-                main)  pattern='^xodos-XoDos-main-p[0-9]+-' ;;
-                x11)   pattern='^xodos-XoDos-x11-p[0-9]+-' ;;
-                root)  pattern='^xodos-XoDos-root-p[0-9]+-' ;;
-                glibc) pattern='^xodos-XoDos-glibc-p[0-9]+-' ;;
-                tur)   pattern='^xodos-XoDos-tur-(continuous|on-device)-p[0-9]+-|^xodos-XoDos-tur-p[0-9]+-' ;;
+            for s in control conffiles md5sums shlibs symbols templates triggers; do
+              [ -f "$tmp/DEBIAN/$s" ] && chmod 0644 "$tmp/DEBIAN/$s" || true
+            done
+          fi
+          if [ -f "$tmp/DEBIAN/conffiles" ]; then
+            : > "$tmp/DEBIAN/conffiles.new"
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="${line%$'\r'}"
+              case "$line" in
+                ""|\#*) printf '%s\n' "$line" >> "$tmp/DEBIAN/conffiles.new"; continue ;;
               esac
-              if echo "$tag" | grep -qE "$pattern"; then
-                echo "$target|$tag" >> "$WORK_DIR/tags-for-run.txt"
-                break
+              rel="${line#/}"
+              if [ -e "$tmp/$rel" ] || [ -L "$tmp/$rel" ]; then
+                printf '%s\n' "$line" >> "$tmp/DEBIAN/conffiles.new"
               fi
-            done
-          done
-          if [ ! -s "$WORK_DIR/tags-for-run.txt" ]; then
-            echo "::error::No matching tags"; exit 1
+            done < "$tmp/DEBIAN/conffiles"
+            mv "$tmp/DEBIAN/conffiles.new" "$tmp/DEBIAN/conffiles"
           fi
-          echo ">>> tags to download:"
-          sed 's/^/    /' "$WORK_DIR/tags-for-run.txt"
-          while IFS='|' read -r target tag; do
-            [ -z "$tag" ] && continue
-            echo ">>> $target / $tag"
-            tmpdir=$(mktemp -d)
-            if ! download_tag "$tag" "$tmpdir"; then
-              echo "    FAIL: $tag"
-              failed="$failed $tag"
-              rm -rf "$tmpdir"
-              continue
-            fi
-            n=$(find "$tmpdir" -maxdepth 1 -name '*.deb' | wc -l)
-            echo "    got $n .deb"
-            mkdir -p "/tmp/gh-debs/${target}"
-            find "$tmpdir" -maxdepth 1 -name '*.deb' -print0 \
-              | xargs -0r mv -t "/tmp/gh-debs/${target}/"
-            rm -rf "$tmpdir"
-            sleep 2
-          done < "$WORK_DIR/tags-for-run.txt"
-          if [ -n "$failed" ]; then
-            echo "::error::Failed tags:$failed"; exit 1
-          fi
-          total=$(find /tmp/gh-debs -type f -name '*.deb' | wc -l)
-          echo ">>> downloaded .deb: $total"
-          du -sh /tmp/gh-debs
-
-      - name: Stage pool tree
-        if: ${{ inputs.mode != 'metadata-only' }}
-        run: |
-          set -euo pipefail
-          POOL=/tmp/pool-tree
-          rm -rf "$POOL"
-          mkdir -p "$POOL"
-          while IFS='|' read -r target tag; do
-            [ -z "$tag" ] && continue
-            comp=""
-            case "$tag" in
-              xodos-XoDos-main-p*)           comp=main ;;
-              xodos-XoDos-x11-p*)            comp=main ;;
-              xodos-XoDos-root-p*)           comp=stable ;;
-              xodos-XoDos-glibc-p*)          comp=main ;;
-              xodos-XoDos-tur-continuous-p*) comp=tur-continuous ;;
-              xodos-XoDos-tur-on-device-p*)  comp=tur-on-device ;;
-              xodos-XoDos-tur-p*)            comp=tur ;;
-            esac
-            [ -z "$comp" ] && continue
-            src="/tmp/gh-debs/${target}"
-            [ -d "$src" ] || continue
-            shopt -s nullglob
-            for deb in "$src"/*.deb; do
-              [ -f "$deb" ] || continue
-              pkg=$(dpkg-deb -f "$deb" Package 2>/dev/null || echo "")
-              [ -z "$pkg" ] && continue
-              fl=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
-              dest="$POOL/${target}/pool/${comp}/${fl}/${pkg}"
-              mkdir -p "$dest"
-              cp -a "$deb" "$dest/" 2>/dev/null || true
-            done
-            shopt -u nullglob
-          done < "$WORK_DIR/tags-for-run.txt"
-          echo ">>> .deb staged: $(find "$POOL" -type f -name '*.deb' | wc -l)"
-
-      - name: Build dists metadata
-        run: |
-          set -euo pipefail
-          BUILD=/tmp/aptrepo
-          rm -rf "$BUILD"
-          mkdir -p "$BUILD"
-          if [ "$MODE" = "metadata-only" ]; then
-            SRC_ROOT=/tmp/hf-debs
-          else
-            SRC_ROOT=/tmp/pool-tree
-          fi
-          echo ">>> SRC_ROOT=$SRC_ROOT"
-
-          : > "$WORK_DIR/targets-built.txt"
-          : > "$WORK_DIR/targets-missing.txt"
-
-          while read -r target dist comp; do
-            [ -z "$target" ] && continue
-            pooldir="$SRC_ROOT/${target}/pool/${comp}"
-            if [ ! -d "$pooldir" ]; then
-              echo ">>> skip $target/$comp (no pool)"
-              continue
-            fi
-            outd="$BUILD/$target/dists/$dist/$comp/binary-aarch64"
-            mkdir -p "$outd"
-            : > "$outd/Packages"
-            tsv="/tmp/t-${target}-${comp}.tsv"
-            : > "$tsv"
-            shopt -s nullglob
-            for deb in "$pooldir"/*/*/*.deb; do
-              dpkg-deb -I "$deb" >/dev/null 2>&1 || continue
-              printf '%s\t%s\t%s\n' \
-                "$(dpkg-deb -f "$deb" Package)" \
-                "$(dpkg-deb -f "$deb" Version)" \
-                "$deb" >> "$tsv"
-            done
-            shopt -u nullglob
-            in_n=$(wc -l < "$tsv")
-            echo ">>> $target/$comp: input=$in_n"
-            [ "$in_n" -eq 0 ] && continue
-            sort -t$'\t' -k1,1 -k2,2rV "$tsv" | awk -F'\t' '!seen[$1]++' > "${tsv}.w"
-            placed=0
-            while IFS=$'\t' read -r pkg ver deb; do
-              [ -z "$pkg" ] && continue
-              fname=$(basename "$deb")
-              fl=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
-              relpath="${target}/pool/${comp}/${fl}/${pkg}/${fname}"
-              size=$(stat -c %s "$deb")
-              md5=$(md5sum "$deb" | awk '{print $1}')
-              sha1=$(sha1sum "$deb" | awk '{print $1}')
-              sha256=$(sha256sum "$deb" | awk '{print $1}')
-              dpkg-deb -f "$deb" >> "$outd/Packages"
-              {
-                echo "Filename: ${relpath}"
-                echo "Size: ${size}"
-                echo "MD5sum: ${md5}"
-                echo "SHA1: ${sha1}"
-                echo "SHA256: ${sha256}"
-                echo ""
-              } >> "$outd/Packages"
-              placed=$((placed + 1))
-            done < "${tsv}.w"
-            echo "    placed: $placed"
-            gzip -kf -9 "$outd/Packages"
-            rm -f "$outd/Packages.xz" "$tsv" "${tsv}.w"
-          done < "$WORK_DIR/dist-comp.txt"
-
-          cd "$BUILD"
-          while read -r target; do
-            [ -z "$target" ] && continue
-            [ -d "$target/dists" ] || continue
-            for dist_dir in "$target"/dists/*/; do
-              [ -d "$dist_dir" ] || continue
-              dist="$(basename "$dist_dir")"
-              comps=""
-              for comp_dir in "$dist_dir"*/; do
-                [ -d "$comp_dir" ] || continue
-                c="$(basename "$comp_dir")"
-                [ -s "$comp_dir/binary-aarch64/Packages" ] && \
-                  comps="${comps}${comps:+ }$c"
+          find "$tmp/data" -type d -print0 2>/dev/null \
+            | while IFS= read -r -d '' d; do
+                cur="$(stat -c '%a' "$d" 2>/dev/null || echo 755)"
+                if [ $((0$cur & 0700)) -ne 0700 ]; then chmod u+rwx "$d" 2>/dev/null || true; fi
               done
-              [ -z "$comps" ] && continue
-              conf="/tmp/rel-${target}-${dist}.conf"
-              {
-                echo 'APT::FTPArchive::Release::Origin "xodos";'
-                echo "APT::FTPArchive::Release::Label \"xodos ${target}/${dist}\";"
-                echo "APT::FTPArchive::Release::Suite \"${dist}\";"
-                echo "APT::FTPArchive::Release::Codename \"${dist}\";"
-                echo 'APT::FTPArchive::Release::Architectures "aarch64";'
-                echo "APT::FTPArchive::Release::Components \"${comps}\";"
-                echo "APT::FTPArchive::Release::Description \"xodos ${target} (${dist})\";"
-              } > "$conf"
-              apt-ftparchive -c "$conf" release "$target/dists/$dist" \
-                > "$target/dists/$dist/Release"
-              cp "$target/dists/$dist/Release" "$target/dists/$dist/InRelease"
-            done
-          done < "$WORK_DIR/targets.txt"
+          if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then echo "OK"; exit 0; fi
+          rm -f "$dst"
+          if dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$dst" >/dev/null 2>&1; then echo "OK-FALLBACK-GZIP"; exit 0; fi
+          rm -f "$dst"
+          if dpkg-deb -b "$tmp" "$dst" >/dev/null 2>&1; then echo "OK-FALLBACK-NOROG"; exit 0; fi
+          rm -f "$dst"
+          cp -a "$src" "$dst"; echo "UNPATCHED-COPIED"; exit 0
+          EOS
+          chmod +x /tmp/patch_one.sh
 
-          while read -r target; do
-            [ -z "$target" ] && continue
-            if [ -d "$target/dists" ] && \
-               find "$target/dists" -type f -name Release | grep -q . && \
-               find "$target/dists" -type f -name InRelease | grep -q .; then
-              echo ">>> OK      $target"
-              echo "$target" >> "$WORK_DIR/targets-built.txt"
-            else
-              echo ">>> MISSING $target"
-              echo "$target" >> "$WORK_DIR/targets-missing.txt"
-            fi
-          done < "$WORK_DIR/targets.txt"
+          cat > /tmp/dl_and_patch.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          repo="$1"; url="$2"
+          outdir="work/patched/$repo"
+          mkdir -p "$outdir"
+          enc="$(basename "$url")"
+          fn="$(printf '%s' "$enc" | perl -pe 's/%([0-9A-Fa-f]{2})/chr(hex($1))/ge')"
+          tmpfile="work/tmp/$fn"
+          outfile="$outdir/$fn"
+          [ -s "$outfile" ] && exit 0
+          curl -fsSL --retry 4 --retry-delay 2 --max-time 600 -o "$tmpfile" "$url" 2>/dev/null \
+            || { rm -f "$tmpfile"; echo "DL-FAIL $repo/$fn" >> work/failures.log; exit 0; }
+          outcome="$(/tmp/patch_one.sh "$tmpfile" "$outfile" 2>/dev/null | tail -1 || echo "FAIL-UNKNOWN")"
+          rm -f "$tmpfile"
+          [ -z "$outcome" ] && outcome="OK"
+          printf '%s\t%s\t%s\n' "$repo" "$outcome" "$fn" >> work/outcomes.log
+          [ ! -s "$outfile" ] && echo "FAIL $repo/$fn" >> work/failures.log
+          exit 0
+          EOS
+          chmod +x /tmp/dl_and_patch.sh
 
-          echo ">>> built:   $(wc -l < "$WORK_DIR/targets-built.txt")"
-          echo ">>> missing: $(wc -l < "$WORK_DIR/targets-missing.txt")"
-          echo ">>> dists size: $(du -sh "$BUILD" | awk '{print $1}')"
+          total=$(wc -l < work/missing-urls.txt)
+          echo ">>> downloading + patching $total files (6 parallel) ..."
+          xargs -a work/missing-urls.txt -P 6 -I{} bash /tmp/dl_and_patch.sh {} || true
 
-      - name: Upload to Hugging Face
+          echo ""
+          echo ">>> outcome summary:"
+          if [ -s work/outcomes.log ]; then
+            awk -F'\t' '{print $2}' work/outcomes.log | sort | uniq -c | sort -rn
+          fi
+          echo ">>> failure count: $(wc -l < work/failures.log)"
+          echo ">>> per-repo produced:"
+          for d in work/patched/*/; do
+            [ -d "$d" ] && echo "    $(basename "$d"): $(find "$d" -maxdepth 1 -name '*.deb' | wc -l)"
+          done
+
+      # ==================================================================
+      # 4. Upload the fixes as a new release per repo.
+      #    Only the new .deb files get uploaded. Existing releases untouched.
+      # ==================================================================
+      - name: Upload fix releases
+        if: ${{ inputs.dry_run == false }}
         run: |
           set -euo pipefail
-          cat > /tmp/upload.py << 'PYEOF'
-          import os, time
-          from huggingface_hub import HfApi
+          TS=$(date -u +'%Y.%m.%d-%H%M%S')
 
-          api = HfApi()
-          repo = os.environ["HF_REPO"]
-          token = os.environ["HF_TOKEN"]
-          mode = os.environ["MODE"]
-          work = os.environ["WORK_DIR"]
-
-          api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True, token=token)
-          print(">>> HF repo:", repo, "| mode:", mode)
-
-          built = [l.strip() for l in open(work + "/targets-built.txt") if l.strip()]
-          print(">>> built targets:", built)
-
-          def upload_folder_any(folder_path, path_in_repo, label):
-              if hasattr(api, "upload_large_folder"):
-                  print(f"    [{label}] HfApi.upload_large_folder")
-                  os.environ["HF_TOKEN"] = token
-                  api.upload_large_folder(
-                      folder_path=folder_path, repo_id=repo,
-                      repo_type="dataset", path_in_repo=path_in_repo,
-                      num_workers=4,
-                  )
-              else:
-                  print(f"    [{label}] HfApi.upload_folder")
-                  api.upload_folder(
-                      folder_path=folder_path, repo_id=repo,
-                      repo_type="dataset", path_in_repo=path_in_repo,
-                      token=token, commit_message=f"Upload {path_in_repo}",
-                  )
-
-          def with_retry(fn, label):
-              for attempt in range(1, 6):
-                  try:
-                      fn()
-                      return
-                  except Exception as e:
-                      msg = str(e)
-                      if "429" in msg or "Too Many Requests" in msg or "rate limit" in msg.lower():
-                          sleep_s = attempt * 60
-                          print(f">>> {label}: rate limited (attempt {attempt}/5), sleeping {sleep_s}s")
-                          time.sleep(sleep_s)
-                      else:
-                          raise
-              raise SystemExit(f"::error::{label} failed after 5 attempts")
-
-          if mode == "pool-only":
-              for t in built:
-                  local_pool = "/tmp/pool-tree/" + t + "/pool"
-                  if not os.path.isdir(local_pool):
-                      print(">>> skip pool", t); continue
-                  print(">>> uploading", t + "/pool/ ...")
-                  with_retry(lambda t=t, local_pool=local_pool: upload_folder_any(
-                      local_pool, t + "/pool", f"pool {t}"
-                  ), f"pool upload {t}")
-                  print(">>> uploaded", t + "/pool/")
-              raise SystemExit(0)
-
-          for t in built:
-              try:
-                  api.delete_files(repo_id=repo, repo_type="dataset",
-                                   delete_patterns=[t + "/dists/**"], token=token)
-                  print(">>> cleared", t + "/dists/**")
-              except Exception as e:
-                  print(">>> WARN clear", t, type(e).__name__, e)
-
-          if mode == "full":
-              for t in built:
-                  local_pool = "/tmp/pool-tree/" + t + "/pool"
-                  if not os.path.isdir(local_pool):
-                      print(">>> skip pool", t); continue
-                  print(">>> uploading", t + "/pool/ ...")
-                  with_retry(lambda t=t, local_pool=local_pool: upload_folder_any(
-                      local_pool, t + "/pool", f"pool {t}"
-                  ), f"pool upload {t}")
-                  print(">>> uploaded", t + "/pool/")
-
-          for t in built:
-              local_dists = "/tmp/aptrepo/" + t + "/dists"
-              if not os.path.isdir(local_dists):
-                  print(">>> skip dists", t); continue
-              print(">>> uploading", t + "/dists/ ...")
-              with_retry(lambda t=t, local_dists=local_dists: upload_folder_any(
-                  local_dists, t + "/dists", f"dists {t}"
-              ), f"dists upload {t}")
-              print(">>> uploaded", t + "/dists/")
-          print(">>> done")
-          PYEOF
-          python3 /tmp/upload.py
-
-      - name: Verify URLs
-        run: |
-          set -euo pipefail
-          base="https://huggingface.co/datasets/${HF_REPO}/resolve/main"
-          fail=0
-          while read -r target dist comp; do
-            [ -z "$target" ] && continue
-            if ! grep -qx "$target" "$WORK_DIR/targets-built.txt"; then
-              echo "  SKIP  $target (not built this run)"
+          for repo_dir in work/patched/*/; do
+            [ -d "$repo_dir" ] || continue
+            repo=$(basename "$repo_dir")
+            mapfile -t files < <(find "$repo_dir" -maxdepth 1 -name '*.deb' -printf '%p\n' | sort)
+            n="${#files[@]}"
+            if [ "$n" -eq 0 ]; then
+              echo ">>> no files for repo $repo — skipping"
               continue
             fi
-            for f in "Release" "InRelease" "${comp}/binary-aarch64/Packages.gz"; do
-              url="${base}/${target}/dists/${dist}/${f}?t=$(date +%s)"
-              code=$(curl -sL -o /dev/null -w "%{http_code}" "$url")
-              printf '  %s  %s\n' "$code" "${target}/dists/${dist}/${f}"
-              [ "$code" = "200" ] || fail=$((fail+1))
-            done
-          done < "$WORK_DIR/dist-comp.txt"
-          if [ "$fail" -gt 0 ]; then
-            echo "::error::$fail URLs unreachable"; exit 1
-          fi
-          echo ">>> all URLs OK"
 
-      - name: Report missing targets
+            tag="xodos-XoDos-${repo}-${UPLOAD_SUFFIX}-${TS}"
+            echo "=================================================="
+            echo ">>> creating release: $tag ($n files)"
+            echo "=================================================="
+
+            if ! gh release view "$tag" --repo "$SRC_REPO" >/dev/null 2>&1; then
+              gh release create "$tag" --repo "$SRC_REPO" \
+                --title "XoDos ${repo} fix release — ${TS}" \
+                --notes "Missing packages for **${repo}** discovered on $(date -u +'%Y-%m-%d %H:%M:%S UTC').
+
+            These packages exist in the official Termux pool but were **absent** from previous XoDos releases.
+            All packages patched: \`com.termux\` → \`app.xodos2\`." \
+                --target "$(gh api "repos/$SRC_REPO" --jq .default_branch)"
+            fi
+
+            i=0; failed=0
+            while [ "$i" -lt "$n" ]; do
+              batch_end=$((i + 20))
+              [ "$batch_end" -gt "$n" ] && batch_end="$n"
+              batch=( "${files[@]:i:batch_end-i}" )
+              if gh release upload "$tag" "${batch[@]}" --repo "$SRC_REPO" --clobber \
+                   2>/tmp/gh_err.log; then
+                i="$batch_end"
+                echo "  [$i/$n] uploaded"
+              else
+                echo "  batch failed: $(head -2 /tmp/gh_err.log)"
+                failed=$((failed + batch_end - i))
+                i="$batch_end"
+              fi
+              sleep 1
+            done
+
+            echo ">>> $tag: uploaded $((n - failed))/$n files"
+          done
+
+      - name: Final summary
         if: always()
         run: |
-          set -euo pipefail
-          if [ ! -s "$WORK_DIR/targets-missing.txt" ]; then
-            echo ">>> all selected targets built successfully"
-            exit 0
-          fi
-          echo "::error::The following targets had no pool data:"
-          while read -r t; do
-            [ -z "$t" ] && continue
-            echo "::error::    $t"
-          done < "$WORK_DIR/targets-missing.txt"
-          exit 1
-
-      - name: Summary
-        run: |
           {
-            echo "## APT Repository Regenerated"
+            echo "## Fix Missing Packages — report"
             echo ""
-            echo "**Mode:** \`${{ inputs.mode }}\`"
-            echo "**Repos:** \`${{ inputs.repos }}\`"
-            echo "**clean_hf:** \`${{ inputs.clean_hf }}\`"
+            echo "**Dry run:** \`${{ inputs.dry_run }}\`"
+            echo "**Repos checked:** \`${{ inputs.repos }}\`"
             echo ""
-            echo "### Built this run"
-            echo '```'
-            cat "$WORK_DIR/targets-built.txt" 2>/dev/null || echo "(none)"
-            echo '```'
-            if [ -s "$WORK_DIR/targets-missing.txt" ]; then
+            cat work/missing-report.txt 2>/dev/null || true
+            if [ "${{ inputs.dry_run }}" = "false" ]; then
               echo ""
-              echo "### Missing (no pool data)"
+              echo "### Produced fixes"
               echo '```'
-              cat "$WORK_DIR/targets-missing.txt"
+              for d in work/patched/*/; do
+                [ -d "$d" ] && echo "$(basename "$d"): $(find "$d" -maxdepth 1 -name '*.deb' | wc -l) files"
+              done
               echo '```'
             fi
           } >> $GITHUB_STEP_SUMMARY

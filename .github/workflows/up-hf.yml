@@ -62,20 +62,13 @@ jobs:
             r=$(echo "$r" | tr -d ' ')
             [ -z "$r" ] && continue
             case "$r" in
-              main)
-                printf 'main\thttps://packages-cf.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-main\n' >> work/repo-urls.txt ;;
-              x11)
-                printf 'x11\thttps://packages-cf.termux.dev/apt/termux-x11/dists/x11/main/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-x11\n' >> work/repo-urls.txt ;;
-              root)
-                printf 'root\thttps://packages-cf.termux.dev/apt/termux-root/dists/root/stable/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-root\n' >> work/repo-urls.txt ;;
-              glibc)
-                printf 'glibc\thttps://packages-cf.termux.dev/apt/termux-glibc/dists/glibc/stable/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-glibc\n' >> work/repo-urls.txt ;;
-              tur)
-                printf 'tur\thttps://tur.kcubeterm.com/dists/tur-packages/tur/binary-aarch64/Packages\thttps://tur.kcubeterm.com\n' >> work/repo-urls.txt ;;
-              tur-on-device)
-                printf 'tur-on-device\thttps://tur.kcubeterm.com/dists/tur-packages/tur-on-device/binary-aarch64/Packages\thttps://tur.kcubeterm.com\n' >> work/repo-urls.txt ;;
-              tur-continuous)
-                printf 'tur-continuous\thttps://tur.kcubeterm.com/dists/tur-packages/tur-continuous/binary-aarch64/Packages\thttps://tur.kcubeterm.com\n' >> work/repo-urls.txt ;;
+              main)   printf 'main\thttps://packages-cf.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-main\n' >> work/repo-urls.txt ;;
+              x11)    printf 'x11\thttps://packages-cf.termux.dev/apt/termux-x11/dists/x11/main/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-x11\n' >> work/repo-urls.txt ;;
+              root)   printf 'root\thttps://packages-cf.termux.dev/apt/termux-root/dists/root/stable/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-root\n' >> work/repo-urls.txt ;;
+              glibc)  printf 'glibc\thttps://packages-cf.termux.dev/apt/termux-glibc/dists/glibc/stable/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-glibc\n' >> work/repo-urls.txt ;;
+              tur)    printf 'tur\thttps://tur.kcubeterm.com/dists/tur-packages/tur/binary-aarch64/Packages\thttps://tur.kcubeterm.com\n' >> work/repo-urls.txt ;;
+              tur-on-device) printf 'tur-on-device\thttps://tur.kcubeterm.com/dists/tur-packages/tur-on-device/binary-aarch64/Packages\thttps://tur.kcubeterm.com\n' >> work/repo-urls.txt ;;
+              tur-continuous) printf 'tur-continuous\thttps://tur.kcubeterm.com/dists/tur-packages/tur-continuous/binary-aarch64/Packages\thttps://tur.kcubeterm.com\n' >> work/repo-urls.txt ;;
               *) echo "::warning::Unknown repo: $r" ;;
             esac
           done
@@ -88,21 +81,37 @@ jobs:
           : > work/missing-report.txt
           : > work/missing-urls.txt
 
+          # FIX: fetch ALL tags once, with --paginate --slurp
+          echo ">>> fetching all release tags from $SRC_REPO ..."
+          gh api --paginate --slurp "repos/$SRC_REPO/releases?per_page=100" \
+            | jq -r '.[][] | .tag_name' > work/all-tags.txt
+          echo ">>> total releases: $(wc -l < work/all-tags.txt)"
+
           while IFS=$'\t' read -r repo packages_url base_url; do
             [ -z "$repo" ] && continue
             echo "=================================================="
             echo ">>> repo: $repo"
             echo "=================================================="
 
-            echo ">>> listing existing XoDos assets for '$repo'..."
-            gh api "repos/$SRC_REPO/releases?per_page=100" --paginate \
-              --jq ".[] | select(.tag_name | test(\"^xodos-XoDos-${repo}-p[0-9]+-\")) | .assets[]?.name" \
-              > "work/existing-$repo.txt" 2>/dev/null || true
+            # (a) Filter tags for this repo
+            grep -E "^xodos-XoDos-${repo}-p[0-9]+-" work/all-tags.txt \
+              | sort -u > "work/tags-$repo.txt"
+            echo ">>>   tags found for $repo: $(wc -l < "work/tags-$repo.txt")"
+
+            # (b) For each tag, list assets
+            : > "work/existing-$repo.txt"
+            while IFS= read -r tag; do
+              [ -z "$tag" ] && continue
+              gh release view "$tag" --repo "$SRC_REPO" \
+                --json assets --jq '.assets[]?.name' \
+                >> "work/existing-$repo.txt" 2>/dev/null || true
+            done < "work/tags-$repo.txt"
 
             awk -F'_' 'NF>=3 {print $1}' "work/existing-$repo.txt" | sort -u \
               > "work/existing-pkgs-$repo.txt"
             echo ">>>   existing packages in $repo: $(wc -l < "work/existing-pkgs-$repo.txt")"
 
+            # (c) Fetch official Packages
             echo ">>> fetching official Packages for '$repo'..."
             if ! curl -fsSL --retry 4 --retry-delay 2 --max-time 180 \
                    -o "work/Packages-$repo" "$packages_url"; then
@@ -118,11 +127,8 @@ jobs:
                 if (pkg != "" && fname != "") {
                   if (fname ~ /_aarch64\.deb$/ || fname ~ /_all\.deb$/) {
                     gsub(/\/$/, "", base)
-                    if (fname ~ /^https?:\/\//) {
-                      print pkg "\t" fname
-                    } else {
-                      print pkg "\t" base "/" fname
-                    }
+                    if (fname ~ /^https?:\/\//) print pkg "\t" fname
+                    else print pkg "\t" base "/" fname
                   }
                 }
                 pkg=""; fname=""
@@ -131,11 +137,8 @@ jobs:
                 if (pkg != "" && fname != "") {
                   if (fname ~ /_aarch64\.deb$/ || fname ~ /_all\.deb$/) {
                     gsub(/\/$/, "", base)
-                    if (fname ~ /^https?:\/\//) {
-                      print pkg "\t" fname
-                    } else {
-                      print pkg "\t" base "/" fname
-                    }
+                    if (fname ~ /^https?:\/\//) print pkg "\t" fname
+                    else print pkg "\t" base "/" fname
                   }
                 }
               }
@@ -147,7 +150,6 @@ jobs:
 
             comm -23 "work/official-pkgs-$repo.txt" "work/existing-pkgs-$repo.txt" \
               > "work/missing-$repo.txt"
-
             missing_count=$(wc -l < "work/missing-$repo.txt")
             echo ">>>   MISSING in $repo: $missing_count"
 
@@ -161,9 +163,7 @@ jobs:
               echo ""
               echo "### $repo — ❌ $missing_count missing packages"
               head -60 "work/missing-$repo.txt" | sed 's/^/    /'
-              if [ "$missing_count" -gt 60 ]; then
-                echo "    ... and $((missing_count - 60)) more"
-              fi
+              [ "$missing_count" -gt 60 ] && echo "    ... and $((missing_count - 60)) more"
             } >> work/missing-report.txt
 
             awk -F'\t' 'NR==FNR { want[$1]=1; next } want[$1] { print $2 }' \
@@ -178,7 +178,6 @@ jobs:
             echo ">>>   URLs to fetch: $(wc -l < "work/missing-urls-$repo.txt")"
             awk -v r="$repo" '{print r "\t" $0}' "work/missing-urls-$repo.txt" \
               >> work/missing-urls.txt
-
           done < work/repo-urls.txt
 
           echo ""
@@ -198,16 +197,9 @@ jobs:
           echo ">>> DRY_RUN = $DRY_RUN"
           if [ "$DRY_RUN" = "true" ]; then
             echo ">>> This was a report-only run. No downloads, no uploads."
-            echo ">>> Re-run with dry_run=false to fetch and patch the missing packages."
           fi
           echo "===================================================================="
 
-      # ==================================================================
-      # 3. Download + patch only the missing packages
-      #    FIX: dl_and_patch.sh takes ONE argument (the whole tab-
-      #    separated line) and splits it internally. xargs -I{} passes
-      #    the entire line as $1, not split by tab.
-      # ==================================================================
       - name: Download and patch
         if: ${{ inputs.dry_run == false }}
         run: |
@@ -219,21 +211,43 @@ jobs:
           cat > /tmp/patch_one.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
+          set -x   # verbose
+
           src="$1"; dst="$2"
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
+
           if [ -e "$dst" ]; then
             if dpkg-deb -I "$dst" >/dev/null 2>&1; then echo "OK-CACHED"; exit 0; fi
             rm -f "$dst"
           fi
-          if ! dpkg-deb -R "$src" "$tmp" 2>/dev/null; then
-            cp -a "$src" "$dst"; echo "FAIL-EXTRACT"; exit 0
+
+          # magic-byte check
+          magic="$(head -c 8 "$src")"
+          if [ "$magic" != "!<arch>" ]; then
+            echo "NOT-A-DEB" >&2
+            cp -a "$src" "$dst"
+            echo "UNPATCHED-COPIED"
+            exit 0
           fi
+
+          if ! dpkg-deb -R "$src" "$tmp" 2>/tmp/dpkg-err.$$; then
+            echo "EXTRACT-FAIL" >&2
+            cat /tmp/dpkg-err.$$ >&2
+            rm -f /tmp/dpkg-err.$$
+            cp -a "$src" "$dst"
+            echo "UNPATCHED-COPIED"
+            exit 0
+          fi
+          rm -f /tmp/dpkg-err.$$
+
           [ -d "$tmp/data/data/com.termux" ] && mv "$tmp/data/data/com.termux" "$tmp/data/data/app.xodos2"
+
           while IFS= read -r -d '' link; do
             t="$(readlink "$link" 2>/dev/null || true)"
             case "$t" in *com.termux*) ln -sfn "${t//com.termux/app.xodos2}" "$link" || true ;; esac
           done < <(find "$tmp" -type l -print0 2>/dev/null || true)
+
           while IFS= read -r -d '' f; do
             case "$f" in
               *.gz|*.xz|*.zst|*.bz2|*.lz4|*.lzma|*.zip|*.jar|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico) continue ;;
@@ -242,6 +256,7 @@ jobs:
               perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' "$f" 2>/dev/null || true
             fi
           done < <(find "$tmp" -type f -print0 2>/dev/null || true)
+
           if [ -d "$tmp/DEBIAN" ]; then
             for s in preinst postinst prerm postrm config; do
               [ -f "$tmp/DEBIAN/$s" ] && chmod 0755 "$tmp/DEBIAN/$s" || true
@@ -250,6 +265,7 @@ jobs:
               [ -f "$tmp/DEBIAN/$s" ] && chmod 0644 "$tmp/DEBIAN/$s" || true
             done
           fi
+
           if [ -f "$tmp/DEBIAN/conffiles" ]; then
             : > "$tmp/DEBIAN/conffiles.new"
             while IFS= read -r line || [ -n "$line" ]; do
@@ -264,25 +280,25 @@ jobs:
             done < "$tmp/DEBIAN/conffiles"
             mv "$tmp/DEBIAN/conffiles.new" "$tmp/DEBIAN/conffiles"
           fi
+
           find "$tmp/data" -type d -print0 2>/dev/null \
             | while IFS= read -r -d '' d; do
                 cur="$(stat -c '%a' "$d" 2>/dev/null || echo 755)"
                 if [ $((0$cur & 0700)) -ne 0700 ]; then chmod u+rwx "$d" 2>/dev/null || true; fi
               done
+
           if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then echo "OK"; exit 0; fi
           rm -f "$dst"
           if dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$dst" >/dev/null 2>&1; then echo "OK-FALLBACK-GZIP"; exit 0; fi
           rm -f "$dst"
           if dpkg-deb -b "$tmp" "$dst" >/dev/null 2>&1; then echo "OK-FALLBACK-NOROG"; exit 0; fi
           rm -f "$dst"
-          cp -a "$src" "$dst"; echo "UNPATCHED-COPIED"; exit 0
+          cp -a "$src" "$dst"
+          echo "UNPATCHED-COPIED"
+          exit 0
           EOS
           chmod +x /tmp/patch_one.sh
 
-          # ==========================================================
-          # FIX: script takes ONE arg (the whole line "repo\turl"),
-          # splits it by tab internally.
-          # ==========================================================
           cat > /tmp/dl_and_patch.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -300,9 +316,19 @@ jobs:
           tmpfile="work/tmp/$fn"
           outfile="$outdir/$fn"
           [ -s "$outfile" ] && exit 0
-          curl -fsSL --retry 4 --retry-delay 2 --max-time 600 -o "$tmpfile" "$url" 2>/dev/null \
-            || { rm -f "$tmpfile"; echo "DL-FAIL $repo/$fn" >> work/failures.log; exit 0; }
-          outcome="$(/tmp/patch_one.sh "$tmpfile" "$outfile" 2>/dev/null | tail -1 || echo "FAIL-UNKNOWN")"
+          if ! curl -fsSL --retry 4 --retry-delay 2 --max-time 600 -o "$tmpfile" "$url" 2>/tmp/curl-err.$$; then
+            echo "DL-FAIL $repo/$fn" >> work/failures.log
+            cat /tmp/curl-err.$$ >&2
+            rm -f /tmp/curl-err.$$
+            exit 0
+          fi
+          rm -f /tmp/curl-err.$$
+          outcome="$(/tmp/patch_one.sh "$tmpfile" "$outfile" 2>/tmp/patch-err.$$ | tail -1 || echo "FAIL-UNKNOWN")"
+          if [ "$outcome" = "FAIL-UNKNOWN" ]; then
+            echo "PATCH-FAIL $repo/$fn" >> work/failures.log
+            cat /tmp/patch-err.$$ >&2
+          fi
+          rm -f /tmp/patch-err.$$
           rm -f "$tmpfile"
           [ -z "$outcome" ] && outcome="OK"
           printf '%s\t%s\t%s\n' "$repo" "$outcome" "$fn" >> work/outcomes.log
@@ -313,8 +339,6 @@ jobs:
 
           total=$(wc -l < work/missing-urls.txt)
           echo ">>> downloading + patching $total files (6 parallel) ..."
-
-          # xargs passes one whole line per invocation
           xargs -a work/missing-urls.txt -P 6 -I{} bash /tmp/dl_and_patch.sh {} || true
 
           echo ""
@@ -333,7 +357,6 @@ jobs:
         run: |
           set -euo pipefail
           TS=$(date -u +'%Y.%m.%d-%H%M%S')
-
           for repo_dir in work/patched/*/; do
             [ -d "$repo_dir" ] || continue
             repo=$(basename "$repo_dir")
@@ -343,29 +366,22 @@ jobs:
               echo ">>> no files for repo $repo — skipping"
               continue
             fi
-
             tag="xodos-XoDos-${repo}-${UPLOAD_SUFFIX}-${TS}"
             echo "=================================================="
             echo ">>> creating release: $tag ($n files)"
             echo "=================================================="
-
             if ! gh release view "$tag" --repo "$SRC_REPO" >/dev/null 2>&1; then
               gh release create "$tag" --repo "$SRC_REPO" \
                 --title "XoDos ${repo} fix release — ${TS}" \
-                --notes "Missing packages for **${repo}** discovered on $(date -u +'%Y-%m-%d %H:%M:%S UTC').
-
-            These packages exist in the official Termux pool but were **absent** from previous XoDos releases.
-            All packages patched: \`com.termux\` → \`app.xodos2\`." \
+                --notes "Missing packages for **${repo}** discovered on $(date -u +'%Y-%m-%d %H:%M:%S UTC')." \
                 --target "$(gh api "repos/$SRC_REPO" --jq .default_branch)"
             fi
-
             i=0; failed=0
             while [ "$i" -lt "$n" ]; do
               batch_end=$((i + 20))
               [ "$batch_end" -gt "$n" ] && batch_end="$n"
               batch=( "${files[@]:i:batch_end-i}" )
-              if gh release upload "$tag" "${batch[@]}" --repo "$SRC_REPO" --clobber \
-                   2>/tmp/gh_err.log; then
+              if gh release upload "$tag" "${batch[@]}" --repo "$SRC_REPO" --clobber 2>/tmp/gh_err.log; then
                 i="$batch_end"
                 echo "  [$i/$n] uploaded"
               else
@@ -375,7 +391,6 @@ jobs:
               fi
               sleep 1
             done
-
             echo ">>> $tag: uploaded $((n - failed))/$n files"
           done
 

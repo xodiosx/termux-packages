@@ -53,18 +53,11 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq binutils xz-utils zstd dpkg-dev perl curl jq
 
-      # ==================================================================
-      # 1. Map repo names to Packages URLs + base URLs
-      #    - glibc uses dists/glibc/stable/binary-aarch64/Packages
-      #    - TUR uses dists/tur-packages/<component>/binary-aarch64/Packages
-      #      and its .deb files are absolute URLs on GitHub Releases
-      # ==================================================================
       - name: Compute repo URLs
         run: |
           set -euo pipefail
           mkdir -p work
           : > work/repo-urls.txt
-
           for r in $(echo "$REPOS_IN" | tr ',' ' '); do
             r=$(echo "$r" | tr -d ' ')
             [ -z "$r" ] && continue
@@ -76,7 +69,6 @@ jobs:
               root)
                 printf 'root\thttps://packages-cf.termux.dev/apt/termux-root/dists/root/stable/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-root\n' >> work/repo-urls.txt ;;
               glibc)
-                # FIXED: glibc Packages path is dists/glibc/stable/binary-aarch64/Packages
                 printf 'glibc\thttps://packages-cf.termux.dev/apt/termux-glibc/dists/glibc/stable/binary-aarch64/Packages\thttps://packages-cf.termux.dev/apt/termux-glibc\n' >> work/repo-urls.txt ;;
               tur)
                 printf 'tur\thttps://tur.kcubeterm.com/dists/tur-packages/tur/binary-aarch64/Packages\thttps://tur.kcubeterm.com\n' >> work/repo-urls.txt ;;
@@ -87,17 +79,9 @@ jobs:
               *) echo "::warning::Unknown repo: $r" ;;
             esac
           done
-
           echo ">>> Repos to process:"
           awk -F'\t' '{print "    " $1}' work/repo-urls.txt
 
-      # ==================================================================
-      # 2. For each repo: fetch official Packages, list existing assets,
-      #    compute the diff.
-      #    - Only entries with a non-empty Filename: are considered "real"
-      #      packages. Meta-packages and virtual packages (no Filename:)
-      #      are automatically excluded from the diff.
-      # ==================================================================
       - name: Compute per-repo diffs
         run: |
           set -euo pipefail
@@ -110,18 +94,15 @@ jobs:
             echo ">>> repo: $repo"
             echo "=================================================="
 
-            # --- (a) existing assets in XoDos releases for THIS repo only ---
             echo ">>> listing existing XoDos assets for '$repo'..."
             gh api "repos/$SRC_REPO/releases?per_page=100" --paginate \
               --jq ".[] | select(.tag_name | test(\"^xodos-XoDos-${repo}-p[0-9]+-\")) | .assets[]?.name" \
               > "work/existing-$repo.txt" 2>/dev/null || true
 
-            # Debian filename convention: <pkg>_<version>_<arch>.deb
             awk -F'_' 'NF>=3 {print $1}' "work/existing-$repo.txt" | sort -u \
               > "work/existing-pkgs-$repo.txt"
             echo ">>>   existing packages in $repo: $(wc -l < "work/existing-pkgs-$repo.txt")"
 
-            # --- (b) official Packages index ---
             echo ">>> fetching official Packages for '$repo'..."
             if ! curl -fsSL --retry 4 --retry-delay 2 --max-time 180 \
                    -o "work/Packages-$repo" "$packages_url"; then
@@ -129,9 +110,6 @@ jobs:
               continue
             fi
 
-            # Extract every Package: block that has BOTH Package: and Filename:.
-            # Meta-packages (only Depends:, no Filename:) are skipped.
-            # Only keep _aarch64.deb and _all.deb entries.
             awk -v base="$base_url" '
               BEGIN { pkg=""; fname="" }
               /^Package: /  { pkg = substr($0, 10) }
@@ -140,7 +118,6 @@ jobs:
                 if (pkg != "" && fname != "") {
                   if (fname ~ /_aarch64\.deb$/ || fname ~ /_all\.deb$/) {
                     gsub(/\/$/, "", base)
-                    # Handle absolute URLs (TUR) vs relative paths (Termux)
                     if (fname ~ /^https?:\/\//) {
                       print pkg "\t" fname
                     } else {
@@ -168,7 +145,6 @@ jobs:
               > "work/official-pkgs-$repo.txt"
             echo ">>>   official packages in $repo: $(wc -l < "work/official-pkgs-$repo.txt")"
 
-            # --- (c) diff: official − existing ---
             comm -23 "work/official-pkgs-$repo.txt" "work/existing-pkgs-$repo.txt" \
               > "work/missing-$repo.txt"
 
@@ -190,7 +166,6 @@ jobs:
               fi
             } >> work/missing-report.txt
 
-            # --- (d) collect URLs for missing packages ---
             awk -F'\t' 'NR==FNR { want[$1]=1; next } want[$1] { print $2 }' \
               "work/missing-$repo.txt" "work/official-$repo.txt" \
               > "work/missing-urls-$repo.txt"
@@ -229,6 +204,9 @@ jobs:
 
       # ==================================================================
       # 3. Download + patch only the missing packages
+      #    FIX: dl_and_patch.sh takes ONE argument (the whole tab-
+      #    separated line) and splits it internally. xargs -I{} passes
+      #    the entire line as $1, not split by tab.
       # ==================================================================
       - name: Download and patch
         if: ${{ inputs.dry_run == false }}
@@ -301,10 +279,20 @@ jobs:
           EOS
           chmod +x /tmp/patch_one.sh
 
+          # ==========================================================
+          # FIX: script takes ONE arg (the whole line "repo\turl"),
+          # splits it by tab internally.
+          # ==========================================================
           cat > /tmp/dl_and_patch.sh <<'EOS'
           #!/usr/bin/env bash
           set -euo pipefail
-          repo="$1"; url="$2"
+          line="$1"
+          repo="${line%%$'\t'*}"
+          url="${line#*$'\t'}"
+          if [ -z "$repo" ] || [ -z "$url" ]; then
+            echo "BAD-LINE: $line" >&2
+            exit 0
+          fi
           outdir="work/patched/$repo"
           mkdir -p "$outdir"
           enc="$(basename "$url")"
@@ -325,6 +313,8 @@ jobs:
 
           total=$(wc -l < work/missing-urls.txt)
           echo ">>> downloading + patching $total files (6 parallel) ..."
+
+          # xargs passes one whole line per invocation
           xargs -a work/missing-urls.txt -P 6 -I{} bash /tmp/dl_and_patch.sh {} || true
 
           echo ""
@@ -338,10 +328,6 @@ jobs:
             [ -d "$d" ] && echo "    $(basename "$d"): $(find "$d" -maxdepth 1 -name '*.deb' | wc -l)"
           done
 
-      # ==================================================================
-      # 4. Upload the fixes as a new release per repo.
-      #    Only the new .deb files get uploaded. Existing releases untouched.
-      # ==================================================================
       - name: Upload fix releases
         if: ${{ inputs.dry_run == false }}
         run: |

@@ -82,7 +82,8 @@ jobs:
               --json tagName,createdAt \
               --jq 'sort_by(.createdAt) | .[].tagName | select(startswith("xodos-XoDos-"))'
           )
-          
+          echo ">>> total releases: ${#TAGS[@]}"
+
           : > "$WORK_DIR/tags-for-run.txt"
           for tag in "${TAGS[@]}"; do
             for target in $(cat "$WORK_DIR/targets.txt"); do
@@ -107,7 +108,6 @@ jobs:
             mkdir -p "$dest"
             local assets_file="/tmp/assets-${tag}.txt"
             gh release view "$tag" --repo "$SRC_REPO" --json assets --jq '.assets[].name' > "$assets_file" 2>/dev/null || return 1
-            
             local ok=0 fail=0 count=0
             while IFS= read -r fname; do
               [ -z "$fname" ] && continue
@@ -116,53 +116,48 @@ jobs:
               local url="https://github.com/${SRC_REPO}/releases/download/${tag}/${fname}"
               local out="$dest/$fname"
               [ -s "$out" ] && { ok=$((ok + 1)); continue; }
-              
               if curl -fsSL --retry 4 --retry-delay 2 --max-time 600 -o "$out" "$url"; then
                 ok=$((ok + 1))
               else
                 fail=$((fail + 1)); rm -f "$out"
               fi
             done < "$assets_file"
-            echo "        $target: ok=$ok fail=$fail"
+            echo "        $target / $tag: ok=$ok fail=$fail"
           }
 
           while IFS='|' read -r target tag; do
             download_tag "$tag" "$target"
           done < "$WORK_DIR/tags-for-run.txt"
+          echo ">>> total .deb: $(find /tmp/gh-debs -type f -name '*.deb' | wc -l)"
 
       - name: Re-patch binaries and scripts using Perl
         run: |
           set -euo pipefail
           POOL=/tmp/pool-tree
           rm -rf "$POOL"; mkdir -p "$POOL"
-          mkdir -p /tmp/fixed
+          : > /tmp/repatch-outcomes.txt
+          : > /tmp/repatch-failures.txt
 
           cat > /tmp/repatch_one.sh <<'EOS'
           #!/usr/bin/env bash
           set -uo pipefail
-
           src="$1"; target="$2"; comp="$3"; pool="$4"
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
 
-          # 1. Extract
-          if ! dpkg-deb -R "$src" "$tmp" 2>/tmp/dpkg.err; then
-            echo "EXTRACT-FAIL $(basename "$src")"
-            return 0
+          if ! dpkg-deb -R "$src" "$tmp" 2>/dev/null; then
+            echo "EXTRACT-FAIL"
+            exit 0
           fi
 
-          # 2. Rename top-level data/data/com.termux* directories
           if [ -d "$tmp/data/data" ]; then
             for d in "$tmp/data/data"/com.termux*; do
               [ -e "$d" ] || continue
               base="$(basename "$d")"
-              newname="${base/com.termux/app.xodos2}"
-              mv "$d" "$tmp/data/data/$newname"
+              mv "$d" "$tmp/data/data/${base/com.termux/app.xodos2}"
             done
           fi
 
-          # 3. Perl binary-safe replace on ALL files
-          # (Both strings are exactly 10 bytes, preserving ELF offsets)
           while IFS= read -r -d '' f; do
             case "$f" in
               *.gz|*.xz|*.zst|*.bz2|*.lz4|*.lzma|*.zip|*.jar|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico) continue ;;
@@ -172,7 +167,6 @@ jobs:
             fi
           done < <(find "$tmp" -type f -print0 2>/dev/null || true)
 
-          # 4. Fix DEBIAN permissions and conffiles
           if [ -d "$tmp/DEBIAN" ]; then
             for s in preinst postinst prerm postrm config; do
               [ -f "$tmp/DEBIAN/$s" ] && chmod 0755 "$tmp/DEBIAN/$s" || true
@@ -192,7 +186,6 @@ jobs:
             fi
           fi
 
-          # 5. Fix data directory permissions (if any)
           if [ -d "$tmp/data" ]; then
             find "$tmp/data" -type d -print0 2>/dev/null | while IFS= read -r -d '' d; do
               cur="$(stat -c '%a' "$d" 2>/dev/null || echo 755)"
@@ -200,23 +193,42 @@ jobs:
             done
           fi
 
-          # 6. Repack
           pkg="$(dpkg-deb -f "$src" Package 2>/dev/null || echo "")"
-          [ -z "$pkg" ] && { echo "NO-PKG-NAME"; return 0; }
+          [ -z "$pkg" ] && { echo "NO-PKG"; exit 0; }
           fl="$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')"
           outdir="$pool/$target/pool/$comp/$fl/$pkg"
           mkdir -p "$outdir"
           dst="$outdir/$(basename "$src")"
 
-          if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then
-            echo "OK"
-          elif dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$dst" >/dev/null 2>&1; then
-            echo "OK"
-          else
-            echo "PACK-FAIL"
+          if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then echo "OK"
+          elif dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$dst" >/dev/null 2>&1; then echo "OK"
+          else echo "PACK-FAIL"
           fi
           EOS
           chmod +x /tmp/repatch_one.sh
+
+          # Worker takes ONE argument (whole "src|target|comp" line) and splits it.
+          cat > /tmp/repatch_worker.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          line="$1"
+          src="${line%%|*}"
+          rest="${line#*|}"
+          target="${rest%%|*}"
+          comp="${rest#*|}"
+          if [ ! -f "$src" ]; then
+            echo "MISSING|$src" >> /tmp/repatch-failures.txt
+            exit 0
+          fi
+          outcome=$(/tmp/repatch_one.sh "$src" "$target" "$comp" "/tmp/pool-tree")
+          printf '%s\t%s\t%s\n' "$outcome" "$target" "$(basename "$src")" >> /tmp/repatch-outcomes.txt
+          case "$outcome" in
+            OK|OK-GZIP|OK-NOROG) : ;;
+            *) echo "REPACK-FAIL|$target|$(basename "$src")" >> /tmp/repatch-failures.txt ;;
+          esac
+          exit 0
+          EOS
+          chmod +x /tmp/repatch_worker.sh
 
           : > /tmp/repatch-input.txt
           while IFS='|' read -r target tag; do
@@ -239,8 +251,14 @@ jobs:
 
           total=$(wc -l < /tmp/repatch-input.txt)
           echo ">>> re-patching $total .deb files via Perl (6 parallel)..."
-          xargs -a /tmp/repatch-input.txt -P 6 -I{} bash /tmp/repatch_one.sh {} || true
-          echo ">>> repacked: $(find "$POOL" -type f -name '*.deb' | wc -l) .deb files"
+          xargs -a /tmp/repatch-input.txt -P 6 -I{} bash /tmp/repatch_worker.sh {} || true
+
+          echo ""
+          echo ">>> outcome summary:"
+          awk -F'\t' '{print $1}' /tmp/repatch-outcomes.txt | sort | uniq -c | sort -rn
+          echo ">>> failures: $(wc -l < /tmp/repatch-failures.txt)"
+          head -10 /tmp/repatch-failures.txt 2>/dev/null || true
+          echo ">>> pool-tree .deb count: $(find "$POOL" -type f -name '*.deb' | wc -l)"
 
       - name: Verify no com.termux paths remain
         run: |
@@ -249,12 +267,12 @@ jobs:
           while IFS= read -r -d '' deb; do
             check=$(dpkg-deb -c "$deb" 2>/dev/null | grep -c '/data/data/com\.termux' || true)
             if [ "${check:-0}" -gt 0 ]; then
-              echo "::error::STILL HAS com.termux: $deb ($check entries)"
+              echo "::error::STILL HAS com.termux: $deb"
               bad=$((bad + 1))
             fi
           done < <(find /tmp/pool-tree -type f -name '*.deb' -print0)
+          echo ">>> checked $(find /tmp/pool-tree -type f -name '*.deb' | wc -l), bad=$bad"
           [ "$bad" -gt 0 ] && { echo "::error::refusing to upload"; exit 1; }
-          echo ">>> all clean"
 
       - name: Build dists metadata
         run: |
@@ -266,21 +284,25 @@ jobs:
           while read -r target dist comp; do
             [ -z "$target" ] && continue
             pooldir="/tmp/pool-tree/${target}/pool/${comp}"
-            [ ! -d "$pooldir" ] && continue
-            
+            if [ ! -d "$pooldir" ]; then
+              echo ">>> skip $target/$comp (no pooldir)"
+              continue
+            fi
             outd="$BUILD/$target/dists/$dist/$comp/binary-aarch64"
             mkdir -p "$outd"; : > "$outd/Packages"
             tsv="/tmp/t-${target}-${comp}.tsv"; : > "$tsv"
-            
             shopt -s nullglob
             for deb in "$pooldir"/*/*/*.deb; do
+              dpkg-deb -I "$deb" >/dev/null 2>&1 || continue
               printf '%s\t%s\t%s\n' \
                 "$(dpkg-deb -f "$deb" Package)" \
                 "$(dpkg-deb -f "$deb" Version)" \
                 "$deb" >> "$tsv"
             done
             shopt -u nullglob
-            
+            in_n=$(wc -l < "$tsv")
+            echo ">>> $target/$comp: input=$in_n"
+            if [ "$in_n" -eq 0 ]; then continue; fi
             sort -t$'\t' -k1,1 -k2,2rV "$tsv" | awk -F'\t' '!seen[$1]++' > "${tsv}.w"
             placed=0
             while IFS=$'\t' read -r pkg ver deb; do
@@ -299,7 +321,7 @@ jobs:
               } >> "$outd/Packages"
               placed=$((placed + 1))
             done < "${tsv}.w"
-            
+            echo "    placed: $placed"
             gzip -kf -9 "$outd/Packages"
             rm -f "$outd/Packages.xz" "$tsv" "${tsv}.w"
           done < "$WORK_DIR/dist-comp.txt"
@@ -333,13 +355,16 @@ jobs:
             done
           done < "$WORK_DIR/targets.txt"
           sort -u "$WORK_DIR/targets-built.txt" -o "$WORK_DIR/targets-built.txt"
+          echo ">>> built targets:"
+          sed 's/^/    /' "$WORK_DIR/targets-built.txt"
 
       - name: Upload to Hugging Face
         run: |
           set -euo pipefail
           cat > /tmp/upload.py << 'PYEOF'
-          import os, time
+          import os, sys, time
           from huggingface_hub import HfApi
+
           api = HfApi()
           repo = os.environ["HF_REPO"]
           token = os.environ["HF_TOKEN"]
@@ -348,31 +373,114 @@ jobs:
 
           api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True, token=token)
           built = [l.strip() for l in open(work + "/targets-built.txt") if l.strip()]
+          print(f">>> HF repo: {repo}")
+          print(f">>> force_push: {force_push}")
+          print(f">>> built targets: {built}")
+
+          if not built:
+              print("::error::targets-built.txt is EMPTY. Nothing to upload.")
+              print("::error::Check the 'Re-patch' and 'Build dists metadata' step logs above.")
+              sys.exit(1)
 
           def upload_folder_any(folder, path_in_repo, label):
               if hasattr(api, "upload_large_folder"):
                   os.environ["HF_TOKEN"] = token
+                  print(f"    [{label}] upload_large_folder")
                   api.upload_large_folder(folder_path=folder, repo_id=repo,
                       repo_type="dataset", path_in_repo=path_in_repo, num_workers=4)
               else:
+                  print(f"    [{label}] upload_folder")
                   api.upload_folder(folder_path=folder, repo_id=repo,
                       repo_type="dataset", path_in_repo=path_in_repo,
                       token=token, commit_message=f"Upload {path_in_repo}")
 
+          def with_retry(fn, label):
+              for attempt in range(1, 6):
+                  try: fn(); return
+                  except Exception as e:
+                      msg = str(e)
+                      if "429" in msg or "rate limit" in msg.lower():
+                          time.sleep(attempt * 60)
+                      else: raise
+              raise SystemExit(f"::error::{label} failed after 5 attempts")
+
           for t in built:
               if force_push:
-                  api.delete_files(repo_id=repo, repo_type="dataset",
-                                   delete_patterns=[t + "/**"], token=token)
+                  print(f">>> FORCE PUSH: clearing {t}/**")
+                  try:
+                      api.delete_files(repo_id=repo, repo_type="dataset",
+                                       delete_patterns=[t + "/**"], token=token,
+                                       commit_message=f"Clear {t}")
+                      print(f">>> cleared {t}/**")
+                  except Exception as e:
+                      print(f">>> WARN clear {t}: {type(e).__name__} {e}")
               else:
-                  api.delete_files(repo_id=repo, repo_type="dataset",
-                                   delete_patterns=[t + "/dists/**"], token=token)
-              
+                  print(f">>> clearing {t}/dists/** only")
+                  try:
+                      api.delete_files(repo_id=repo, repo_type="dataset",
+                                       delete_patterns=[t + "/dists/**"], token=token,
+                                       commit_message=f"Clear {t} dists")
+                  except Exception as e:
+                      print(f">>> WARN clear {t}/dists: {type(e).__name__} {e}")
+
               lp = "/tmp/pool-tree/" + t + "/pool"
               if os.path.isdir(lp):
-                  upload_folder_any(lp, t + "/pool", f"pool {t}")
-              
+                  print(f">>> uploading {t}/pool/ ...")
+                  with_retry(lambda t=t, lp=lp: upload_folder_any(lp, t + "/pool", f"pool {t}"), f"pool {t}")
+                  print(f">>> uploaded {t}/pool/")
+
               ld = "/tmp/aptrepo/" + t + "/dists"
               if os.path.isdir(ld):
-                  upload_folder_any(ld, t + "/dists", f"dists {t}")
+                  print(f">>> uploading {t}/dists/ ...")
+                  with_retry(lambda t=t, ld=ld: upload_folder_any(ld, t + "/dists", f"dists {t}"), f"dists {t}")
+                  print(f">>> uploaded {t}/dists/")
+          print(">>> all uploads complete")
           PYEOF
           python3 /tmp/upload.py
+
+      - name: Verify URLs
+        run: |
+          set -euo pipefail
+          base="https://huggingface.co/datasets/${HF_REPO}/resolve/main"
+          fail=0
+          while read -r target dist comp; do
+            [ -z "$target" ] && continue
+            grep -qx "$target" "$WORK_DIR/targets-built.txt" || continue
+            for f in "Release" "InRelease" "${comp}/binary-aarch64/Packages.gz"; do
+              code=$(curl -sL -o /dev/null -w "%{http_code}" "${base}/${target}/dists/${dist}/${f}?t=$(date +%s)")
+              printf '  %s  %s/dists/%s/%s\n' "$code" "$target" "$dist" "$f"
+              [ "$code" = "200" ] || fail=$((fail+1))
+            done
+            sample=$(find "/tmp/aptrepo/$target" -name Packages | head -1)
+            if [ -n "$sample" ]; then
+              grep '^Filename:' "$sample" > /tmp/sample-fname.txt || true
+              if [ -s /tmp/sample-fname.txt ]; then
+                fname=$(head -1 /tmp/sample-fname.txt | sed 's/^Filename: //')
+                code=$(curl -sL -o /dev/null -w "%{http_code}" "${base}/${target}/${fname}?t=$(date +%s)")
+                printf '  %s  %s/%s\n' "$code" "$target" "$fname"
+                [ "$code" = "200" ] || fail=$((fail+1))
+              fi
+            fi
+          done < "$WORK_DIR/dist-comp.txt"
+          [ "$fail" -gt 0 ] && { echo "::error::$fail URLs unreachable"; exit 1; }
+          echo ">>> all URLs OK"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Post-Install Fixes Applied"
+            echo ""
+            echo "**Repos:** \`${{ inputs.repos }}\`"
+            echo "**Force push:** \`${{ inputs.force_push }}\`"
+            echo ""
+            echo "### Re-patch outcomes"
+            echo '```'
+            awk -F'\t' '{print $1}' /tmp/repatch-outcomes.txt 2>/dev/null | sort | uniq -c | sort -rn || true
+            echo '```'
+            if [ -s /tmp/repatch-failures.txt ]; then
+              echo "### Failures"
+              echo '```'
+              head -30 /tmp/repatch-failures.txt
+              echo '```'
+            fi
+          } >> $GITHUB_STEP_SUMMARY

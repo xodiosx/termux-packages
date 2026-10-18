@@ -5,7 +5,6 @@ on:
     inputs:
       mode:
         description: "Operation mode"
-        required: true
         type: choice
         default: metadata-only
         options:
@@ -24,8 +23,12 @@ on:
         description: "GitHub repo with releases (used in full / pool-only)"
         required: false
         default: "xodiosx/termux-packages"
+      patch_prefix:
+        description: "Patch com.termux → app.xodos2 in every downloaded .deb before staging"
+        type: boolean
+        default: false
       force_push:
-        description: "Force push: for each SELECTED repo, delete its subtree on HF and re-upload. Other repos untouched."
+        description: "Force push: for each SELECTED repo, delete its subtree on HF and re-upload."
         type: boolean
         default: false
       clean_hf:
@@ -50,6 +53,7 @@ jobs:
       SRC_REPO: ${{ inputs.source_repo }}
       MODE: ${{ inputs.mode }}
       REPOS_IN: ${{ inputs.repos }}
+      PATCH_PREFIX: ${{ inputs.patch_prefix }}
       FORCE_PUSH: ${{ inputs.force_push }}
       CLEAN_HF: ${{ inputs.clean_hf }}
       HF_HUB_DISABLE_TELEMETRY: "1"
@@ -59,7 +63,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq dpkg-dev apt-utils gzip jq
+          sudo apt-get install -y -qq dpkg-dev apt-utils gzip jq xz-utils zstd
           pip install -q --upgrade "huggingface_hub>=1.29.0"
 
       - name: Compute targets
@@ -72,42 +76,22 @@ jobs:
             r=$(echo "$r" | tr -d ' ')
             [ -z "$r" ] && continue
             case "$r" in
-              main)
-                echo "xodos-main" >> "$WORK_DIR/targets.txt"
-                echo "xodos-main stable main" >> "$WORK_DIR/dist-comp.txt"
-                ;;
-              x11)
-                echo "xodos-x11" >> "$WORK_DIR/targets.txt"
-                echo "xodos-x11 x11 main" >> "$WORK_DIR/dist-comp.txt"
-                ;;
-              root)
-                echo "xodos-root" >> "$WORK_DIR/targets.txt"
-                echo "xodos-root root stable" >> "$WORK_DIR/dist-comp.txt"
-                ;;
-              glibc)
-                echo "xodos-glibc" >> "$WORK_DIR/targets.txt"
-                echo "xodos-glibc glibc main" >> "$WORK_DIR/dist-comp.txt"
-                ;;
-              tur)
-                echo "xodos-tur" >> "$WORK_DIR/targets.txt"
-                echo "xodos-tur tur-packages tur" >> "$WORK_DIR/dist-comp.txt"
-                ;;
-              tur-on-device)
-                echo "xodos-tur" >> "$WORK_DIR/targets.txt"
-                echo "xodos-tur tur-packages tur-on-device" >> "$WORK_DIR/dist-comp.txt"
-                ;;
-              tur-continuous)
-                echo "xodos-tur" >> "$WORK_DIR/targets.txt"
-                echo "xodos-tur tur-packages tur-continuous" >> "$WORK_DIR/dist-comp.txt"
-                ;;
+              main)           echo "xodos-main"  >> "$WORK_DIR/targets.txt"; echo "xodos-main stable main"          >> "$WORK_DIR/dist-comp.txt" ;;
+              x11)            echo "xodos-x11"   >> "$WORK_DIR/targets.txt"; echo "xodos-x11 x11 main"                >> "$WORK_DIR/dist-comp.txt" ;;
+              root)           echo "xodos-root"  >> "$WORK_DIR/targets.txt"; echo "xodos-root root stable"            >> "$WORK_DIR/dist-comp.txt" ;;
+              glibc)          echo "xodos-glibc" >> "$WORK_DIR/targets.txt"; echo "xodos-glibc glibc main"            >> "$WORK_DIR/dist-comp.txt" ;;
+              tur)            echo "xodos-tur"   >> "$WORK_DIR/targets.txt"; echo "xodos-tur tur-packages tur"        >> "$WORK_DIR/dist-comp.txt" ;;
+              tur-on-device)  echo "xodos-tur"   >> "$WORK_DIR/targets.txt"; echo "xodos-tur tur-packages tur-on-device" >> "$WORK_DIR/dist-comp.txt" ;;
+              tur-continuous) echo "xodos-tur"   >> "$WORK_DIR/targets.txt"; echo "xodos-tur tur-packages tur-continuous" >> "$WORK_DIR/dist-comp.txt" ;;
               *) echo "::error::Unknown repo: $r"; exit 1 ;;
             esac
           done
           sort -u "$WORK_DIR/targets.txt" -o "$WORK_DIR/targets.txt"
           sort -u "$WORK_DIR/dist-comp.txt" -o "$WORK_DIR/dist-comp.txt"
-          echo ">>> Mode:       $MODE"
-          echo ">>> Force push: $FORCE_PUSH"
-          echo ">>> Clean HF:   $CLEAN_HF"
+          echo ">>> Mode:         $MODE"
+          echo ">>> Patch prefix: $PATCH_PREFIX"
+          echo ">>> Force push:   $FORCE_PUSH"
+          echo ">>> Clean HF:     $CLEAN_HF"
           echo ">>> Targets:"
           sed 's/^/    /' "$WORK_DIR/targets.txt"
 
@@ -219,7 +203,6 @@ jobs:
           mkdir -p /tmp/gh-debs
           : > "$WORK_DIR/tags-for-run.txt"
 
-          echo ">>> listing tags from $SRC_REPO ..."
           mapfile -t TAGS < <(
             gh release list --repo "$SRC_REPO" --limit 1000 \
               --json tagName,createdAt \
@@ -244,30 +227,20 @@ jobs:
             done
           done
           if [ ! -s "$WORK_DIR/tags-for-run.txt" ]; then
-            echo "::error::No matching tags for selected repos"
-            exit 1
+            echo "::error::No matching tags"; exit 1
           fi
-          echo ">>> tags to download:"
-          sed 's/^/    /' "$WORK_DIR/tags-for-run.txt"
 
           download_tag() {
             local tag="$1" target="$2"
             local dest="/tmp/gh-debs/$target"
             mkdir -p "$dest"
-
             local assets_file="/tmp/assets-${tag}.txt"
             if ! gh release view "$tag" --repo "$SRC_REPO" \
-                 --json assets --jq '.assets[].name' > "$assets_file" 2>/tmp/gh_err.log; then
-              echo "        FAIL to list assets: $(head -1 /tmp/gh_err.log)"
-              return 1
+                 --json assets --jq '.assets[].name' > "$assets_file" 2>/dev/null; then
+              echo "        FAIL list: $tag"; return 1
             fi
-            local total
-            total=$(wc -l < "$assets_file")
-            echo "        $total assets in release"
-            if [ "$total" -eq 0 ]; then
-              echo "        no assets"; return 1
-            fi
-
+            local total; total=$(wc -l < "$assets_file")
+            echo "        $total assets"
             local ok=0 fail=0 count=0
             while IFS= read -r fname; do
               [ -z "$fname" ] && continue
@@ -275,32 +248,21 @@ jobs:
               count=$((count + 1))
               local url="https://github.com/${SRC_REPO}/releases/download/${tag}/${fname}"
               local out="$dest/$fname"
-              if [ -s "$out" ]; then
-                ok=$((ok + 1))
-                continue
-              fi
-              local attempt=1 curl_ok=0
+              [ -s "$out" ] && { ok=$((ok + 1)); continue; }
+              local attempt=1 cok=0
               while [ "$attempt" -le 5 ]; do
                 if curl -fsSL --retry 0 --connect-timeout 30 --max-time 600 \
-                     -o "$out" "$url" 2>/tmp/curl_err.log; then
-                  curl_ok=1
-                  break
+                     -o "$out" "$url" 2>/dev/null; then
+                  cok=1; break
                 fi
-                rm -f "$out"
-                sleep $((attempt * 3))
-                attempt=$((attempt + 1))
+                rm -f "$out"; sleep $((attempt * 3)); attempt=$((attempt + 1))
               done
-              if [ "$curl_ok" = "1" ]; then
-                ok=$((ok + 1))
-              else
-                fail=$((fail + 1))
-                echo "        FAIL: $fname"
-              fi
+              if [ "$cok" = "1" ]; then ok=$((ok + 1)); else fail=$((fail + 1)); fi
               if [ $((count % 200)) -eq 0 ]; then
-                echo "        [$count/$total]  ok=$ok fail=$fail"
+                echo "        [$count/$total] ok=$ok fail=$fail"
               fi
             done < "$assets_file"
-            echo "        done: downloaded=$ok failed=$fail"
+            echo "        done: ok=$ok fail=$fail"
             return 0
           }
 
@@ -310,24 +272,146 @@ jobs:
           while IFS='|' read -r target tag; do
             [ -z "$tag" ] && continue
             tag_num=$((tag_num + 1))
-            echo "=================================================="
             echo ">>> [$tag_num/$total_tags] $target / $tag"
-            echo "=================================================="
-            if ! download_tag "$tag" "$target"; then
-              failed="$failed $tag"
-            fi
+            if ! download_tag "$tag" "$target"; then failed="$failed $tag"; fi
           done < "$WORK_DIR/tags-for-run.txt"
 
-          if [ -n "$failed" ]; then
-            echo "::error::Tags that failed:$failed"
-            exit 1
-          fi
-
-          total=$(find /tmp/gh-debs -type f -name '*.deb' | wc -l)
-          echo ""
-          echo ">>> total .deb downloaded: $total"
+          if [ -n "$failed" ]; then echo "::error::Failed:$failed"; exit 1; fi
+          echo ">>> total .deb: $(find /tmp/gh-debs -type f -name '*.deb' | wc -l)"
           du -sh /tmp/gh-debs
 
+      # ==================================================================
+      # NEW STEP: optional prefix patch
+      # Runs AFTER download, BEFORE staging.
+      # Uses perl (-0777) because com.termux and app.xodos2 are both
+      # exactly 10 bytes, so ELF offsets stay valid.
+      # ==================================================================
+      - name: Patch com.termux → app.xodos2 in downloaded .deb
+        if: ${{ inputs.patch_prefix }}
+        run: |
+          set -euo pipefail
+
+          if [ "$MODE" = "metadata-only" ]; then
+            SRC_ROOT=/tmp/hf-debs
+          else
+            SRC_ROOT=/tmp/gh-debs
+          fi
+          echo ">>> SRC_ROOT=$SRC_ROOT"
+
+          cat > /tmp/patch_one.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -uo pipefail
+
+          src="$1"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          # Refuse non-.deb
+          magic="$(head -c 8 "$src")"
+          if [ "$magic" != "!<arch>" ]; then
+            echo "NOT-A-DEB: $src" >&2
+            exit 0
+          fi
+
+          # Extract
+          if ! dpkg-deb -R "$src" "$tmp" 2>/tmp/dpkg.err; then
+            echo "EXTRACT-FAIL: $(basename "$src"): $(head -1 /tmp/dpkg.err)" >&2
+            exit 0
+          fi
+
+          # Rename top-level data/data/com.termux* directories
+          if [ -d "$tmp/data/data" ]; then
+            for d in "$tmp/data/data"/com.termux*; do
+              [ -e "$d" ] || continue
+              base="$(basename "$d")"
+              newname="${base/com.termux/app.xodos2}"
+              mv "$d" "$tmp/data/data/$newname"
+            done
+          fi
+
+          # Perl binary-safe replacement on every file
+          while IFS= read -r -d '' f; do
+            case "$f" in
+              *.gz|*.xz|*.zst|*.bz2|*.lz4|*.lzma|*.zip|*.jar|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico) continue ;;
+            esac
+            if grep -qa 'com\.termux' "$f" 2>/dev/null; then
+              perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' "$f" 2>/dev/null || true
+            fi
+          done < <(find "$tmp" -type f -print0 2>/dev/null || true)
+
+          # DEBIAN permissions + conffiles cleanup
+          if [ -d "$tmp/DEBIAN" ]; then
+            for s in preinst postinst prerm postrm config; do
+              [ -f "$tmp/DEBIAN/$s" ] && chmod 0755 "$tmp/DEBIAN/$s" || true
+            done
+            for s in control conffiles md5sums shlibs symbols templates triggers; do
+              [ -f "$tmp/DEBIAN/$s" ] && chmod 0644 "$tmp/DEBIAN/$s" || true
+            done
+            if [ -f "$tmp/DEBIAN/conffiles" ]; then
+              : > "$tmp/DEBIAN/conffiles.new"
+              while IFS= read -r line || [ -n "$line" ]; do
+                line="${line%$'\r'}"
+                case "$line" in ""|\#*) printf '%s\n' "$line" >> "$tmp/DEBIAN/conffiles.new"; continue ;; esac
+                rel="${line#/}"
+                if [ -e "$tmp/$rel" ] || [ -L "$tmp/$rel" ]; then
+                  printf '%s\n' "$line" >> "$tmp/DEBIAN/conffiles.new"
+                fi
+              done < "$tmp/DEBIAN/conffiles"
+              mv "$tmp/DEBIAN/conffiles.new" "$tmp/DEBIAN/conffiles"
+            fi
+          fi
+
+          # Ensure data dirs are readable (only if data/ exists)
+          if [ -d "$tmp/data" ]; then
+            find "$tmp/data" -type d -print0 2>/dev/null | while IFS= read -r -d '' d; do
+              cur="$(stat -c '%a' "$d" 2>/dev/null || echo 755)"
+              if [ $((0$cur & 0700)) -ne 0700 ]; then chmod u+rwx "$d" 2>/dev/null || true; fi
+            done || true
+          fi
+
+          # Repack with fallbacks
+          if dpkg-deb --root-owner-group -b "$tmp" "$src" >/dev/null 2>&1; then
+            echo "OK"
+          elif dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$src" >/dev/null 2>&1; then
+            echo "OK-GZIP"
+          else
+            echo "PACK-FAIL: $src" >&2
+          fi
+          exit 0
+          EOS
+          chmod +x /tmp/patch_one.sh
+
+          : > /tmp/patch-outcomes.txt
+          : > /tmp/patch-failures.txt
+
+          total=0
+          while IFS= read -r -d '' deb; do
+            total=$((total + 1))
+            outcome=$(bash /tmp/patch_one.sh "$deb" 2>/tmp/patch-err)
+            printf '%s\t%s\n' "$outcome" "$deb" >> /tmp/patch-outcomes.txt
+            case "$outcome" in
+              OK|OK-GZIP) ;;
+              *) echo "$outcome: $deb" >> /tmp/patch-failures.txt ;;
+            esac
+            if [ $((total % 100)) -eq 0 ]; then
+              echo ">>> patched $total files so far..."
+            fi
+          done < <(find "$SRC_ROOT" -type f -name '*.deb' -print0)
+
+          echo ""
+          echo ">>> patch summary:"
+          awk -F'\t' '{print $1}' /tmp/patch-outcomes.txt | sort | uniq -c | sort -rn
+          echo ">>> failures: $(wc -l < /tmp/patch-failures.txt)"
+          if [ -s /tmp/patch-failures.txt ]; then
+            head -10 /tmp/patch-failures.txt
+            echo "::error::patching failed — refusing to continue"
+            exit 1
+          fi
+          echo ">>> all $total files patched successfully"
+
+      # ==================================================================
+      # Stage pool tree (unchanged)
+      # ==================================================================
       - name: Stage pool tree
         if: ${{ inputs.mode != 'metadata-only' }}
         run: |
@@ -362,6 +446,9 @@ jobs:
           done < "$WORK_DIR/tags-for-run.txt"
           echo ">>> .deb staged: $(find "$POOL" -type f -name '*.deb' | wc -l)"
 
+      # ==================================================================
+      # Build dists (writes targets-built.txt)
+      # ==================================================================
       - name: Build dists metadata
         run: |
           set -euo pipefail
@@ -374,7 +461,10 @@ jobs:
           while read -r target dist comp; do
             [ -z "$target" ] && continue
             pooldir="$SRC_ROOT/${target}/pool/${comp}"
-            [ ! -d "$pooldir" ] && { echo ">>> skip $target/$comp (no pool)"; continue; }
+            if [ ! -d "$pooldir" ]; then
+              echo ">>> skip $target/$comp (no pool at $pooldir)"
+              continue
+            fi
             outd="$BUILD/$target/dists/$dist/$comp/binary-aarch64"
             mkdir -p "$outd"; : > "$outd/Packages"
             tsv="/tmp/t-${target}-${comp}.tsv"; : > "$tsv"
@@ -444,6 +534,7 @@ jobs:
             done
           done < "$WORK_DIR/targets.txt"
 
+          # Discover built targets
           while read -r target; do
             [ -z "$target" ] && continue
             if [ -d "$target/dists" ] && \
@@ -456,6 +547,27 @@ jobs:
               echo "$target" >> "$WORK_DIR/targets-missing.txt"
             fi
           done < "$WORK_DIR/targets.txt"
+
+          sort -u "$WORK_DIR/targets-built.txt" -o "$WORK_DIR/targets-built.txt"
+          echo ""
+          echo ">>> targets-built.txt has $(wc -l < "$WORK_DIR/targets-built.txt") entries"
+          sed 's/^/    /' "$WORK_DIR/targets-built.txt"
+
+      # ==================================================================
+      # NEW: fail loudly if nothing got built
+      # ==================================================================
+      - name: Sanity check
+        run: |
+          set -euo pipefail
+          n=$(wc -l < "$WORK_DIR/targets-built.txt")
+          if [ "$n" -eq 0 ]; then
+            echo "::error::Nothing was built — targets-built.txt is empty"
+            echo "::error::Check the 'Build dists metadata' step above"
+            echo ">>> targets-missing.txt:"
+            cat "$WORK_DIR/targets-missing.txt" || true
+            exit 1
+          fi
+          echo ">>> OK: $n target(s) ready to upload"
 
       - name: Validate .deb before upload
         run: |
@@ -492,8 +604,8 @@ jobs:
           print(f">>> mode: {mode}   force_push: {force_push}")
           print(f">>> built targets: {built}")
           if not built:
-              print(">>> nothing to do")
-              raise SystemExit(0)
+              print("::error::built is empty — nothing to upload")
+              raise SystemExit(1)
 
           def local_pool_dir(t):
               p = ("/tmp/hf-debs/" + t + "/pool") if mode == "metadata-only" else ("/tmp/pool-tree/" + t + "/pool")
@@ -525,10 +637,12 @@ jobs:
                   except Exception as e:
                       msg = str(e)
                       if "429" in msg or "rate limit" in msg.lower():
+                          print(f"    [{label}] rate limited, sleeping {attempt*60}s")
                           time.sleep(attempt * 60)
                       else:
+                          print(f"    [{label}] FAILED: {type(e).__name__}: {e}")
                           raise
-              raise SystemExit(f"::error::{label} failed")
+              raise SystemExit(f"::error::{label} failed after 5 attempts")
 
           for t in built:
               if force_push:
@@ -576,9 +690,6 @@ jobs:
           PYEOF
           python3 /tmp/upload.py
 
-      # ==================================================================
-      # Verify — NO pipe to head. Writes to files, then reads them.
-      # ==================================================================
       - name: Verify URLs
         run: |
           set -euo pipefail
@@ -600,17 +711,10 @@ jobs:
           for target in $(cat "$WORK_DIR/targets-built.txt"); do
             sample=$(find "/tmp/aptrepo/$target" -name Packages | head -1)
             [ -z "$sample" ] && continue
-
-            # FIX: write grep output to a file, then read it — no pipe to head.
             grep '^Filename:' "$sample" > /tmp/sample-fname.txt || true
-            if [ ! -s /tmp/sample-fname.txt ]; then
-              echo "  MISSING Filename: in $sample"
-              fail=$((fail+1))
-              continue
-            fi
+            [ ! -s /tmp/sample-fname.txt ] && { echo "  MISSING Filename: in $sample"; fail=$((fail+1)); continue; }
             fname=$(head -1 /tmp/sample-fname.txt | sed 's/^Filename: //')
-
-            url="${base}/${target}/${fname}"
+            url="${base}/${target}/${fname}?t=$(date +%s)"
             code=$(curl -sL -o /dev/null -w "%{http_code}" "$url")
             printf '  %s  %s/%s\n' "$code" "$target" "$fname"
             [ "$code" = "200" ] || fail=$((fail+1))
@@ -618,15 +722,6 @@ jobs:
 
           [ "$fail" -gt 0 ] && { echo "::error::$fail URLs unreachable"; exit 1; }
           echo ">>> all URLs OK"
-
-      - name: Report missing targets
-        if: always()
-        run: |
-          set -euo pipefail
-          [ -s "$WORK_DIR/targets-missing.txt" ] || { echo ">>> all targets built"; exit 0; }
-          echo "::error::Targets with no pool data:"
-          while read -r t; do [ -z "$t" ] || echo "::error::    $t"; done < "$WORK_DIR/targets-missing.txt"
-          exit 1
 
       - name: Summary
         run: |
@@ -637,6 +732,7 @@ jobs:
             echo "|---|---|"
             echo "| **Mode** | \`${{ inputs.mode }}\` |"
             echo "| **Repos** | \`${{ inputs.repos }}\` |"
+            echo "| **Patch prefix** | \`${{ inputs.patch_prefix }}\` |"
             echo "| **Force push** | \`${{ inputs.force_push }}\` |"
             echo "| **Clean HF** | \`${{ inputs.clean_hf }}\` |"
             echo ""

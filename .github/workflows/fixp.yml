@@ -1,0 +1,378 @@
+name: Fix Post-Install Scripts & Metadata
+
+on:
+  workflow_dispatch:
+    inputs:
+      hf_repo_id:
+        description: "Hugging Face dataset repo (username/repo-name)"
+        required: true
+        default: "xodiosx/xodos-packages"
+      source_repo:
+        description: "GitHub repo hosting releases"
+        required: true
+        default: "xodiosx/termux-packages"
+      repos:
+        description: "Repos to fix (comma-separated)"
+        required: true
+        default: "x11"
+      force_push:
+        description: "Wipe <target>/** on HF before upload (fresh rebuild)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fix-postinstall
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    env:
+      HF_REPO: ${{ inputs.hf_repo_id }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      GH_TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
+      SRC_REPO: ${{ inputs.source_repo }}
+      REPOS_IN: ${{ inputs.repos }}
+      FORCE_PUSH: ${{ inputs.force_push }}
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      WORK_DIR: ${{ github.workspace }}/work
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dpkg-dev apt-utils gzip jq xz-utils zstd
+          pip install -q --upgrade "huggingface_hub>=1.29.0"
+
+      - name: Compute targets
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK_DIR"
+          : > "$WORK_DIR/targets.txt"
+          : > "$WORK_DIR/dist-comp.txt"
+          for r in $(echo "$REPOS_IN" | tr ',' ' '); do
+            r=$(echo "$r" | tr -d ' ')
+            [ -z "$r" ] && continue
+            case "$r" in
+              main)           echo "xodos-main"  >> "$WORK_DIR/targets.txt"; echo "xodos-main stable main"          >> "$WORK_DIR/dist-comp.txt" ;;
+              x11)            echo "xodos-x11"   >> "$WORK_DIR/targets.txt"; echo "xodos-x11 x11 main"                >> "$WORK_DIR/dist-comp.txt" ;;
+              root)           echo "xodos-root"  >> "$WORK_DIR/targets.txt"; echo "xodos-root root stable"            >> "$WORK_DIR/dist-comp.txt" ;;
+              glibc)          echo "xodos-glibc" >> "$WORK_DIR/targets.txt"; echo "xodos-glibc glibc main"            >> "$WORK_DIR/dist-comp.txt" ;;
+              tur)            echo "xodos-tur"   >> "$WORK_DIR/targets.txt"; echo "xodos-tur tur-packages tur"        >> "$WORK_DIR/dist-comp.txt" ;;
+              tur-on-device)  echo "xodos-tur"   >> "$WORK_DIR/targets.txt"; echo "xodos-tur tur-packages tur-on-device" >> "$WORK_DIR/dist-comp.txt" ;;
+              tur-continuous) echo "xodos-tur"   >> "$WORK_DIR/targets.txt"; echo "xodos-tur tur-packages tur-continuous" >> "$WORK_DIR/dist-comp.txt" ;;
+              *) echo "::error::Unknown repo: $r"; exit 1 ;;
+            esac
+          done
+          sort -u "$WORK_DIR/targets.txt" -o "$WORK_DIR/targets.txt"
+          sort -u "$WORK_DIR/dist-comp.txt" -o "$WORK_DIR/dist-comp.txt"
+
+      - name: Download .deb from GitHub Releases
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/gh-debs
+          mkdir -p /tmp/gh-debs
+
+          echo ">>> listing tags from $SRC_REPO..."
+          mapfile -t TAGS < <(
+            gh release list --repo "$SRC_REPO" --limit 1000 \
+              --json tagName,createdAt \
+              --jq 'sort_by(.createdAt) | .[].tagName | select(startswith("xodos-XoDos-"))'
+          )
+          
+          : > "$WORK_DIR/tags-for-run.txt"
+          for tag in "${TAGS[@]}"; do
+            for target in $(cat "$WORK_DIR/targets.txt"); do
+              short="${target#xodos-}"
+              case "$short" in
+                main)  pattern='^xodos-XoDos-main-p[0-9]+-' ;;
+                x11)   pattern='^xodos-XoDos-x11-p[0-9]+-' ;;
+                root)  pattern='^xodos-XoDos-root-p[0-9]+-' ;;
+                glibc) pattern='^xodos-XoDos-glibc-p[0-9]+-' ;;
+                tur)   pattern='^xodos-XoDos-tur-(continuous|on-device)-p[0-9]+-|^xodos-XoDos-tur-p[0-9]+-' ;;
+              esac
+              if echo "$tag" | grep -qE "$pattern"; then
+                echo "$target|$tag" >> "$WORK_DIR/tags-for-run.txt"
+                break
+              fi
+            done
+          done
+
+          download_tag() {
+            local tag="$1" target="$2"
+            local dest="/tmp/gh-debs/$target"
+            mkdir -p "$dest"
+            local assets_file="/tmp/assets-${tag}.txt"
+            gh release view "$tag" --repo "$SRC_REPO" --json assets --jq '.assets[].name' > "$assets_file" 2>/dev/null || return 1
+            
+            local ok=0 fail=0 count=0
+            while IFS= read -r fname; do
+              [ -z "$fname" ] && continue
+              case "$fname" in *.deb) ;; *) continue ;; esac
+              count=$((count + 1))
+              local url="https://github.com/${SRC_REPO}/releases/download/${tag}/${fname}"
+              local out="$dest/$fname"
+              [ -s "$out" ] && { ok=$((ok + 1)); continue; }
+              
+              if curl -fsSL --retry 4 --retry-delay 2 --max-time 600 -o "$out" "$url"; then
+                ok=$((ok + 1))
+              else
+                fail=$((fail + 1)); rm -f "$out"
+              fi
+            done < "$assets_file"
+            echo "        $target: ok=$ok fail=$fail"
+          }
+
+          while IFS='|' read -r target tag; do
+            download_tag "$tag" "$target"
+          done < "$WORK_DIR/tags-for-run.txt"
+
+      - name: Re-patch binaries and scripts using Perl
+        run: |
+          set -euo pipefail
+          POOL=/tmp/pool-tree
+          rm -rf "$POOL"; mkdir -p "$POOL"
+          mkdir -p /tmp/fixed
+
+          cat > /tmp/repatch_one.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -uo pipefail
+
+          src="$1"; target="$2"; comp="$3"; pool="$4"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          # 1. Extract
+          if ! dpkg-deb -R "$src" "$tmp" 2>/tmp/dpkg.err; then
+            echo "EXTRACT-FAIL $(basename "$src")"
+            return 0
+          fi
+
+          # 2. Rename top-level data/data/com.termux* directories
+          if [ -d "$tmp/data/data" ]; then
+            for d in "$tmp/data/data"/com.termux*; do
+              [ -e "$d" ] || continue
+              base="$(basename "$d")"
+              newname="${base/com.termux/app.xodos2}"
+              mv "$d" "$tmp/data/data/$newname"
+            done
+          fi
+
+          # 3. Perl binary-safe replace on ALL files
+          # (Both strings are exactly 10 bytes, preserving ELF offsets)
+          while IFS= read -r -d '' f; do
+            case "$f" in
+              *.gz|*.xz|*.zst|*.bz2|*.lz4|*.lzma|*.zip|*.jar|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico) continue ;;
+            esac
+            if grep -qa 'com\.termux' "$f" 2>/dev/null; then
+              perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' "$f" 2>/dev/null || true
+            fi
+          done < <(find "$tmp" -type f -print0 2>/dev/null || true)
+
+          # 4. Fix DEBIAN permissions and conffiles
+          if [ -d "$tmp/DEBIAN" ]; then
+            for s in preinst postinst prerm postrm config; do
+              [ -f "$tmp/DEBIAN/$s" ] && chmod 0755 "$tmp/DEBIAN/$s" || true
+            done
+            for s in control conffiles md5sums shlibs symbols templates triggers; do
+              [ -f "$tmp/DEBIAN/$s" ] && chmod 0644 "$tmp/DEBIAN/$s" || true
+            done
+            if [ -f "$tmp/DEBIAN/conffiles" ]; then
+              : > "$tmp/DEBIAN/conffiles.new"
+              while IFS= read -r line || [ -n "$line" ]; do
+                line="${line%$'\r'}"
+                case "$line" in ""|\#*) printf '%s\n' "$line" >> "$tmp/DEBIAN/conffiles.new"; continue ;; esac
+                rel="${line#/}"
+                [ -e "$tmp/$rel" ] || [ -L "$tmp/$rel" ] && printf '%s\n' "$line" >> "$tmp/DEBIAN/conffiles.new"
+              done < "$tmp/DEBIAN/conffiles"
+              mv "$tmp/DEBIAN/conffiles.new" "$tmp/DEBIAN/conffiles"
+            fi
+          fi
+
+          # 5. Fix data directory permissions (if any)
+          if [ -d "$tmp/data" ]; then
+            find "$tmp/data" -type d -print0 2>/dev/null | while IFS= read -r -d '' d; do
+              cur="$(stat -c '%a' "$d" 2>/dev/null || echo 755)"
+              [ $((0$cur & 0700)) -ne 0700 ] && chmod u+rwx "$d" 2>/dev/null || true
+            done
+          fi
+
+          # 6. Repack
+          pkg="$(dpkg-deb -f "$src" Package 2>/dev/null || echo "")"
+          [ -z "$pkg" ] && { echo "NO-PKG-NAME"; return 0; }
+          fl="$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')"
+          outdir="$pool/$target/pool/$comp/$fl/$pkg"
+          mkdir -p "$outdir"
+          dst="$outdir/$(basename "$src")"
+
+          if dpkg-deb --root-owner-group -b "$tmp" "$dst" >/dev/null 2>&1; then
+            echo "OK"
+          elif dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$dst" >/dev/null 2>&1; then
+            echo "OK"
+          else
+            echo "PACK-FAIL"
+          fi
+          EOS
+          chmod +x /tmp/repatch_one.sh
+
+          : > /tmp/repatch-input.txt
+          while IFS='|' read -r target tag; do
+            [ -z "$tag" ] && continue
+            comp=""
+            case "$tag" in
+              xodos-XoDos-main-p*) comp=main ;;
+              xodos-XoDos-x11-p*) comp=main ;;
+              xodos-XoDos-root-p*) comp=stable ;;
+              xodos-XoDos-glibc-p*) comp=main ;;
+              xodos-XoDos-tur-continuous-p*) comp=tur-continuous ;;
+              xodos-XoDos-tur-on-device-p*) comp=tur-on-device ;;
+              xodos-XoDos-tur-p*) comp=tur ;;
+            esac
+            [ -z "$comp" ] && continue
+            while IFS= read -r -d '' deb; do
+              echo "$deb|$target|$comp" >> /tmp/repatch-input.txt
+            done < <(find "/tmp/gh-debs/$target" -maxdepth 1 -name '*.deb' -print0 2>/dev/null || true)
+          done < "$WORK_DIR/tags-for-run.txt"
+
+          total=$(wc -l < /tmp/repatch-input.txt)
+          echo ">>> re-patching $total .deb files via Perl (6 parallel)..."
+          xargs -a /tmp/repatch-input.txt -P 6 -I{} bash /tmp/repatch_one.sh {} || true
+          echo ">>> repacked: $(find "$POOL" -type f -name '*.deb' | wc -l) .deb files"
+
+      - name: Verify no com.termux paths remain
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r -d '' deb; do
+            check=$(dpkg-deb -c "$deb" 2>/dev/null | grep -c '/data/data/com\.termux' || true)
+            if [ "${check:-0}" -gt 0 ]; then
+              echo "::error::STILL HAS com.termux: $deb ($check entries)"
+              bad=$((bad + 1))
+            fi
+          done < <(find /tmp/pool-tree -type f -name '*.deb' -print0)
+          [ "$bad" -gt 0 ] && { echo "::error::refusing to upload"; exit 1; }
+          echo ">>> all clean"
+
+      - name: Build dists metadata
+        run: |
+          set -euo pipefail
+          BUILD=/tmp/aptrepo
+          rm -rf "$BUILD"; mkdir -p "$BUILD"
+          : > "$WORK_DIR/targets-built.txt"
+
+          while read -r target dist comp; do
+            [ -z "$target" ] && continue
+            pooldir="/tmp/pool-tree/${target}/pool/${comp}"
+            [ ! -d "$pooldir" ] && continue
+            
+            outd="$BUILD/$target/dists/$dist/$comp/binary-aarch64"
+            mkdir -p "$outd"; : > "$outd/Packages"
+            tsv="/tmp/t-${target}-${comp}.tsv"; : > "$tsv"
+            
+            shopt -s nullglob
+            for deb in "$pooldir"/*/*/*.deb; do
+              printf '%s\t%s\t%s\n' \
+                "$(dpkg-deb -f "$deb" Package)" \
+                "$(dpkg-deb -f "$deb" Version)" \
+                "$deb" >> "$tsv"
+            done
+            shopt -u nullglob
+            
+            sort -t$'\t' -k1,1 -k2,2rV "$tsv" | awk -F'\t' '!seen[$1]++' > "${tsv}.w"
+            placed=0
+            while IFS=$'\t' read -r pkg ver deb; do
+              [ -z "$pkg" ] && continue
+              fname=$(basename "$deb")
+              fl=$(printf '%s' "$pkg" | cut -c1 | tr 'A-Z' 'a-z')
+              relpath="pool/${comp}/${fl}/${pkg}/${fname}"
+              dpkg-deb -f "$deb" >> "$outd/Packages"
+              {
+                echo "Filename: ${relpath}"
+                echo "Size: $(stat -c %s "$deb")"
+                echo "MD5sum: $(md5sum "$deb" | awk '{print $1}')"
+                echo "SHA1: $(sha1sum "$deb" | awk '{print $1}')"
+                echo "SHA256: $(sha256sum "$deb" | awk '{print $1}')"
+                echo ""
+              } >> "$outd/Packages"
+              placed=$((placed + 1))
+            done < "${tsv}.w"
+            
+            gzip -kf -9 "$outd/Packages"
+            rm -f "$outd/Packages.xz" "$tsv" "${tsv}.w"
+          done < "$WORK_DIR/dist-comp.txt"
+
+          cd "$BUILD"
+          while read -r target; do
+            [ -z "$target" ] && continue
+            [ -d "$target/dists" ] || continue
+            for dist_dir in "$target"/dists/*/; do
+              [ -d "$dist_dir" ] || continue
+              dist="$(basename "$dist_dir")"; comps=""
+              for comp_dir in "$dist_dir"*/; do
+                [ -d "$comp_dir" ] || continue
+                c="$(basename "$comp_dir")"
+                [ -s "$comp_dir/binary-aarch64/Packages" ] && comps="${comps}${comps:+ }$c"
+              done
+              [ -z "$comps" ] && continue
+              conf="/tmp/rel-${target}-${dist}.conf"
+              {
+                echo 'APT::FTPArchive::Release::Origin "xodos";'
+                echo "APT::FTPArchive::Release::Label \"xodos ${target}/${dist}\";"
+                echo "APT::FTPArchive::Release::Suite \"${dist}\";"
+                echo "APT::FTPArchive::Release::Codename \"${dist}\";"
+                echo 'APT::FTPArchive::Release::Architectures "aarch64";'
+                echo "APT::FTPArchive::Release::Components \"${comps}\";"
+                echo "APT::FTPArchive::Release::Description \"xodos ${target} (${dist})\";"
+              } > "$conf"
+              apt-ftparchive -c "$conf" release "$target/dists/$dist" > "$target/dists/$dist/Release"
+              cp "$target/dists/$dist/Release" "$target/dists/$dist/InRelease"
+              echo "$target" >> "$WORK_DIR/targets-built.txt"
+            done
+          done < "$WORK_DIR/targets.txt"
+          sort -u "$WORK_DIR/targets-built.txt" -o "$WORK_DIR/targets-built.txt"
+
+      - name: Upload to Hugging Face
+        run: |
+          set -euo pipefail
+          cat > /tmp/upload.py << 'PYEOF'
+          import os, time
+          from huggingface_hub import HfApi
+          api = HfApi()
+          repo = os.environ["HF_REPO"]
+          token = os.environ["HF_TOKEN"]
+          work = os.environ["WORK_DIR"]
+          force_push = os.environ["FORCE_PUSH"].lower() == "true"
+
+          api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True, token=token)
+          built = [l.strip() for l in open(work + "/targets-built.txt") if l.strip()]
+
+          def upload_folder_any(folder, path_in_repo, label):
+              if hasattr(api, "upload_large_folder"):
+                  os.environ["HF_TOKEN"] = token
+                  api.upload_large_folder(folder_path=folder, repo_id=repo,
+                      repo_type="dataset", path_in_repo=path_in_repo, num_workers=4)
+              else:
+                  api.upload_folder(folder_path=folder, repo_id=repo,
+                      repo_type="dataset", path_in_repo=path_in_repo,
+                      token=token, commit_message=f"Upload {path_in_repo}")
+
+          for t in built:
+              if force_push:
+                  api.delete_files(repo_id=repo, repo_type="dataset",
+                                   delete_patterns=[t + "/**"], token=token)
+              else:
+                  api.delete_files(repo_id=repo, repo_type="dataset",
+                                   delete_patterns=[t + "/dists/**"], token=token)
+              
+              lp = "/tmp/pool-tree/" + t + "/pool"
+              if os.path.isdir(lp):
+                  upload_folder_any(lp, t + "/pool", f"pool {t}")
+              
+              ld = "/tmp/aptrepo/" + t + "/dists"
+              if os.path.isdir(ld):
+                  upload_folder_any(ld, t + "/dists", f"dists {t}")
+          PYEOF
+          python3 /tmp/upload.py

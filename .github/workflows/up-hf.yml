@@ -27,6 +27,10 @@ on:
         description: "Part number for the fix release (default p99)"
         required: false
         default: "p99"
+      patch_prefix:
+        description: "Patch com.termux -> app.xodos2 in downloaded packages"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -46,6 +50,7 @@ jobs:
       DRY_RUN: ${{ inputs.dry_run }}
       MAX_PER_REPO: ${{ inputs.max_per_repo }}
       UPLOAD_SUFFIX: ${{ inputs.upload_tag_suffix }}
+      PATCH_PREFIX: ${{ inputs.patch_prefix }}
 
     steps:
       - name: Install tools
@@ -247,7 +252,14 @@ jobs:
           fi
           rm -f /tmp/dpkg-err.$$
 
-          [ -d "$tmp/data/data/com.termux" ] && mv "$tmp/data/data/com.termux" "$tmp/data/data/app.xodos2"
+          if [ -d "$tmp/data/data" ]; then
+            for d in "$tmp/data/data"/com.termux*; do
+              [ -e "$d" ] || continue
+              base="$(basename "$d")"
+              newname="${base/com.termux/app.xodos2}"
+              mv "$d" "$tmp/data/data/$newname"
+            done
+          fi
 
           while IFS= read -r -d '' link; do
             t="$(readlink "$link" 2>/dev/null || true)"
@@ -287,7 +299,6 @@ jobs:
             mv "$tmp/DEBIAN/conffiles.new" "$tmp/DEBIAN/conffiles"
           fi
 
-          # guard: meta-packages have no data/ dir
           if [ -d "$tmp/data" ]; then
             find "$tmp/data" -type d -print0 2>/dev/null \
               | while IFS= read -r -d '' d; do
@@ -325,7 +336,6 @@ jobs:
 
           enc="$(basename "$url")"
           fn="$(printf '%s' "$enc" | perl -pe 's/%([0-9A-Fa-f]{2})/chr(hex($1))/ge')"
-          # GitHub release asset names cannot contain ':' — replace with '.'
           safe_fn="${fn//:/.}"
           tmpfile="work/tmp/$safe_fn"
           outfile="$outdir/$safe_fn"
@@ -334,15 +344,11 @@ jobs:
 
           dl_ok=0
 
-          # ── Tier 1: primary TUR URL ──
           if curl -fsSL --retry 3 --retry-delay 2 --max-time 600 \
                -o "$tmpfile" "$url" 2>/tmp/curl-err.$$; then
             dl_ok=1
           else
             echo ">>> TUR 404 for $fn — trying main-Termux fallback" >&2
-
-            # ── Tier 2: main Termux repo ──
-            # Extract the bare package name from the TUR filename
             pkg_name="$(printf '%s' "$fn" | sed -E 's/_[0-9].*$//')"
             main_pkgs="${GITHUB_WORKSPACE:-$PWD}/work/Packages-main"
 
@@ -383,16 +389,23 @@ jobs:
           fi
           rm -f /tmp/curl-err.$$ /tmp/curl-err2.$$
 
-          outcome="$(/tmp/patch_one.sh "$tmpfile" "$outfile" 2>/tmp/patch-err.$$ | tail -1 || echo "FAIL-UNKNOWN")"
-          if [ "$outcome" = "FAIL-UNKNOWN" ]; then
-            echo "PATCH-FAIL $repo/$fn" >> work/failures.log
-            cat /tmp/patch-err.$$ >&2
+          # ── Patch step based on checkbox ──
+          if [ "${PATCH_PREFIX}" = "true" ]; then
+            outcome="$(/tmp/patch_one.sh "$tmpfile" "$outfile" 2>/tmp/patch-err.$$ | tail -1 || echo "FAIL-UNKNOWN")"
+            if [ "$outcome" = "FAIL-UNKNOWN" ]; then
+              echo "PATCH-FAIL $repo/$fn" >> work/failures.log
+              cat /tmp/patch-err.$$ >&2
+            fi
+            rm -f /tmp/patch-err.$$
+            rm -f "$tmpfile"
+            [ -z "$outcome" ] && outcome="OK"
+            printf '%s\t%s\t%s\n' "$repo" "$outcome" "$safe_fn" >> work/outcomes.log
+            [ ! -s "$outfile" ] && echo "FAIL $repo/$fn" >> work/failures.log
+          else
+            # No patching requested
+            mv "$tmpfile" "$outfile"
+            printf '%s\t%s\t%s\n' "$repo" "DOWNLOAD-ONLY" "$safe_fn" >> work/outcomes.log
           fi
-          rm -f /tmp/patch-err.$$
-          rm -f "$tmpfile"
-          [ -z "$outcome" ] && outcome="OK"
-          printf '%s\t%s\t%s\n' "$repo" "$outcome" "$safe_fn" >> work/outcomes.log
-          [ ! -s "$outfile" ] && echo "FAIL $repo/$fn" >> work/failures.log
           exit 0
           EOS
           chmod +x /tmp/dl_and_patch.sh
@@ -465,6 +478,7 @@ jobs:
             echo "## Fix Missing Packages — report"
             echo ""
             echo "**Dry run:** \`${{ inputs.dry_run }}\`"
+            echo "**Patch prefix:** \`${{ inputs.patch_prefix }}\`"
             echo "**Repos checked:** \`${{ inputs.repos }}\`"
             echo ""
             cat work/missing-report.txt 2>/dev/null || true

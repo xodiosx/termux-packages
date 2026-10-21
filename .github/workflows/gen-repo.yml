@@ -319,15 +319,14 @@ jobs:
             exit 0
           fi
 
-          # Rename top-level data/data/com.termux* directories
-          if [ -d "$tmp/data/data" ]; then
-            for d in "$tmp/data/data"/com.termux*; do
-              [ -e "$d" ] || continue
-              base="$(basename "$d")"
-              newname="${base/com.termux/app.xodos2}"
-              mv "$d" "$tmp/data/data/$newname"
-            done
-          fi
+          # ---------------------------------------------------------
+          # FIXED: Rename ALL directories containing com.termux, 
+          # anywhere in the tree, not just top-level data/data/com.termux
+          # ---------------------------------------------------------
+          find "$tmp" -depth -type d -name '*com.termux*' -print0 | while IFS= read -r -d '' d; do
+            newname="${d//com.termux/app.xodos2}"
+            mv "$d" "$newname" 2>/dev/null || true
+          done
 
           # Perl binary-safe replacement on every file
           while IFS= read -r -d '' f; do

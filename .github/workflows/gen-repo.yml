@@ -304,7 +304,8 @@ jobs:
           root = sys.argv[1]
           
           # 1. Rename all nested directories containing com.termux (bottom-up)
-          for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+          # Added followlinks=False to prevent patching outside the extraction dir
+          for dirpath, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
               for d in dirnames:
                   if 'com.termux' in d:
                       old_path = os.path.join(dirpath, d)
@@ -322,7 +323,7 @@ jobs:
           old_be = "com.termux".encode("utf-16-be")
           new_be = "app.xodos2".encode("utf-16-be")
 
-          for dirpath, _, filenames in os.walk(root):
+          for dirpath, _, filenames in os.walk(root, followlinks=False):
               for filename in filenames:
                   # Skip compressed archives to avoid corruption
                   if filename.endswith(('.gz', '.xz', '.zst', '.bz2', '.lz4', '.lzma', '.zip', '.jar', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico')):

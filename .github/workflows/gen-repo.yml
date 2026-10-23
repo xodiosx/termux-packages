@@ -24,9 +24,9 @@ on:
         required: false
         default: "xodiosx/termux-packages"
       patch_prefix:
-        description: "Patch com.termux → app.xodos2 in every downloaded .deb before staging"
+        description: "Patch com.termux → app.xodos2 (ASCII + UTF-16) in .deb files"
         type: boolean
-        default: false
+        default: true
       force_push:
         description: "Force push: for each SELECTED repo, delete its subtree on HF and re-upload."
         type: boolean
@@ -281,10 +281,9 @@ jobs:
           du -sh /tmp/gh-debs
 
       # ==================================================================
-      # NEW STEP: optional prefix patch
-      # Runs AFTER download, BEFORE staging.
-      # Uses Python because perl only handles 8-bit ASCII.
-      # Python handles ASCII, UTF-16 LE, and UTF-16 BE.
+      # PATCH STEP: Optional prefix patch.
+      # Uses a single, highly optimized Python script per .deb.
+      # Handles ASCII, UTF-16 LE, UTF-16 BE, and nested directories.
       # ==================================================================
       - name: Patch com.termux → app.xodos2 in downloaded .deb
         if: ${{ inputs.patch_prefix }}
@@ -298,16 +297,24 @@ jobs:
           fi
           echo ">>> SRC_ROOT=$SRC_ROOT"
 
-          cat > /tmp/patch_file.py <<'PYEOF'
-          import sys
+          # Create the Python script that handles both folder renames and file patching
+          cat > /tmp/patch_dir.py <<'PYEOF'
+          import os, sys
 
-          path = sys.argv[1]
-          try:
-              with open(path, "rb") as f:
-                  data = f.read()
-          except Exception:
-              sys.exit(0)
+          root = sys.argv[1]
+          
+          # 1. Rename all nested directories containing com.termux (bottom-up)
+          for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+              for d in dirnames:
+                  if 'com.termux' in d:
+                      old_path = os.path.join(dirpath, d)
+                      new_path = os.path.join(dirpath, d.replace('com.termux', 'app.xodos2'))
+                      try:
+                          os.rename(old_path, new_path)
+                      except Exception:
+                          pass
 
+          # 2. Patch binary and text files
           old_ascii = b"com.termux"
           new_ascii = b"app.xodos2"
           old_le = "com.termux".encode("utf-16-le")
@@ -315,20 +322,35 @@ jobs:
           old_be = "com.termux".encode("utf-16-be")
           new_be = "app.xodos2".encode("utf-16-be")
 
-          changed = False
-          if old_ascii in data:
-              data = data.replace(old_ascii, new_ascii)
-              changed = True
-          if old_le in data:
-              data = data.replace(old_le, new_le)
-              changed = True
-          if old_be in data:
-              data = data.replace(old_be, new_be)
-              changed = True
+          for dirpath, _, filenames in os.walk(root):
+              for filename in filenames:
+                  # Skip compressed archives to avoid corruption
+                  if filename.endswith(('.gz', '.xz', '.zst', '.bz2', '.lz4', '.lzma', '.zip', '.jar', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico')):
+                      continue
+                  filepath = os.path.join(dirpath, filename)
+                  try:
+                      with open(filepath, 'rb') as f:
+                          data = f.read()
+                  except Exception:
+                      continue
 
-          if changed:
-              with open(path, "wb") as f:
-                  f.write(data)
+                  changed = False
+                  if old_ascii in data:
+                      data = data.replace(old_ascii, new_ascii)
+                      changed = True
+                  if old_le in data:
+                      data = data.replace(old_le, new_le)
+                      changed = True
+                  if old_be in data:
+                      data = data.replace(old_be, new_be)
+                      changed = True
+
+                  if changed:
+                      try:
+                          with open(filepath, 'wb') as f:
+                              f.write(data)
+                      except Exception:
+                          pass
           PYEOF
 
           cat > /tmp/patch_one.sh <<'EOS'
@@ -352,22 +374,8 @@ jobs:
             exit 0
           fi
 
-          # ---------------------------------------------------------
-          # FIXED: Rename ALL directories containing com.termux, 
-          # anywhere in the tree, not just top-level data/data/com.termux
-          # ---------------------------------------------------------
-          find "$tmp" -depth -type d -name '*com.termux*' -print0 | while IFS= read -r -d '' d; do
-            newname="${d//com.termux/app.xodos2}"
-            mv "$d" "$newname" 2>/dev/null || true
-          done
-
-          # Python binary-safe replacement on every file
-          while IFS= read -r -d '' f; do
-            case "$f" in
-              *.gz|*.xz|*.zst|*.bz2|*.lz4|*.lzma|*.zip|*.jar|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico) continue ;;
-            esac
-            python3 /tmp/patch_file.py "$f"
-          done < <(find "$tmp" -type f -print0 2>/dev/null || true)
+          # Run the python patcher on the extracted directory
+          python3 /tmp/patch_dir.py "$tmp"
 
           # DEBIAN permissions + conffiles cleanup
           if [ -d "$tmp/DEBIAN" ]; then
@@ -439,9 +447,6 @@ jobs:
           fi
           echo ">>> all $total files patched successfully"
 
-      # ==================================================================
-      # Stage pool tree (unchanged)
-      # ==================================================================
       - name: Stage pool tree
         if: ${{ inputs.mode != 'metadata-only' }}
         run: |
@@ -476,9 +481,6 @@ jobs:
           done < "$WORK_DIR/tags-for-run.txt"
           echo ">>> .deb staged: $(find "$POOL" -type f -name '*.deb' | wc -l)"
 
-      # ==================================================================
-      # Build dists (writes targets-built.txt)
-      # ==================================================================
       - name: Build dists metadata
         run: |
           set -euo pipefail
@@ -564,7 +566,6 @@ jobs:
             done
           done < "$WORK_DIR/targets.txt"
 
-          # Discover built targets
           while read -r target; do
             [ -z "$target" ] && continue
             if [ -d "$target/dists" ] && \
@@ -583,9 +584,6 @@ jobs:
           echo ">>> targets-built.txt has $(wc -l < "$WORK_DIR/targets-built.txt") entries"
           sed 's/^/    /' "$WORK_DIR/targets-built.txt"
 
-      # ==================================================================
-      # NEW: fail loudly if nothing got built
-      # ==================================================================
       - name: Sanity check
         run: |
           set -euo pipefail

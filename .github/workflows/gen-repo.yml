@@ -283,8 +283,8 @@ jobs:
       # ==================================================================
       # NEW STEP: optional prefix patch
       # Runs AFTER download, BEFORE staging.
-      # Uses perl (-0777) because com.termux and app.xodos2 are both
-      # exactly 10 bytes, so ELF offsets stay valid.
+      # Uses Python because perl only handles 8-bit ASCII.
+      # Python handles ASCII, UTF-16 LE, and UTF-16 BE.
       # ==================================================================
       - name: Patch com.termux → app.xodos2 in downloaded .deb
         if: ${{ inputs.patch_prefix }}
@@ -297,6 +297,39 @@ jobs:
             SRC_ROOT=/tmp/gh-debs
           fi
           echo ">>> SRC_ROOT=$SRC_ROOT"
+
+          cat > /tmp/patch_file.py <<'PYEOF'
+          import sys
+
+          path = sys.argv[1]
+          try:
+              with open(path, "rb") as f:
+                  data = f.read()
+          except Exception:
+              sys.exit(0)
+
+          old_ascii = b"com.termux"
+          new_ascii = b"app.xodos2"
+          old_le = "com.termux".encode("utf-16-le")
+          new_le = "app.xodos2".encode("utf-16-le")
+          old_be = "com.termux".encode("utf-16-be")
+          new_be = "app.xodos2".encode("utf-16-be")
+
+          changed = False
+          if old_ascii in data:
+              data = data.replace(old_ascii, new_ascii)
+              changed = True
+          if old_le in data:
+              data = data.replace(old_le, new_le)
+              changed = True
+          if old_be in data:
+              data = data.replace(old_be, new_be)
+              changed = True
+
+          if changed:
+              with open(path, "wb") as f:
+                  f.write(data)
+          PYEOF
 
           cat > /tmp/patch_one.sh <<'EOS'
           #!/usr/bin/env bash
@@ -328,14 +361,12 @@ jobs:
             mv "$d" "$newname" 2>/dev/null || true
           done
 
-          # Perl binary-safe replacement on every file
+          # Python binary-safe replacement on every file
           while IFS= read -r -d '' f; do
             case "$f" in
               *.gz|*.xz|*.zst|*.bz2|*.lz4|*.lzma|*.zip|*.jar|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.ico) continue ;;
             esac
-            if grep -qa 'com\.termux' "$f" 2>/dev/null; then
-              perl -0777 -i -pe 's{com\.termux}{app.xodos2}g' "$f" 2>/dev/null || true
-            fi
+            python3 /tmp/patch_file.py "$f"
           done < <(find "$tmp" -type f -print0 2>/dev/null || true)
 
           # DEBIAN permissions + conffiles cleanup

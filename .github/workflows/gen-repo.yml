@@ -280,11 +280,6 @@ jobs:
           echo ">>> total .deb: $(find /tmp/gh-debs -type f -name '*.deb' | wc -l)"
           du -sh /tmp/gh-debs
 
-      # ==================================================================
-      # PATCH STEP: Optional prefix patch.
-      # Uses a single, highly optimized Python script per .deb.
-      # Handles ASCII, UTF-16 LE, UTF-16 BE, and nested directories.
-      # ==================================================================
       - name: Patch com.termux → app.xodos2 in downloaded .deb
         if: ${{ inputs.patch_prefix }}
         run: |
@@ -297,14 +292,10 @@ jobs:
           fi
           echo ">>> SRC_ROOT=$SRC_ROOT"
 
-          # Create the Python script that handles both folder renames and file patching
           cat > /tmp/patch_dir.py <<'PYEOF'
           import os, sys
-
           root = sys.argv[1]
           
-          # 1. Rename all nested directories containing com.termux (bottom-up)
-          # Added followlinks=False to prevent patching outside the extraction dir
           for dirpath, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
               for d in dirnames:
                   if 'com.termux' in d:
@@ -315,7 +306,6 @@ jobs:
                       except Exception:
                           pass
 
-          # 2. Patch binary and text files
           old_ascii = b"com.termux"
           new_ascii = b"app.xodos2"
           old_le = "com.termux".encode("utf-16-le")
@@ -325,7 +315,6 @@ jobs:
 
           for dirpath, _, filenames in os.walk(root, followlinks=False):
               for filename in filenames:
-                  # Skip compressed archives to avoid corruption
                   if filename.endswith(('.gz', '.xz', '.zst', '.bz2', '.lz4', '.lzma', '.zip', '.jar', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico')):
                       continue
                   filepath = os.path.join(dirpath, filename)
@@ -357,28 +346,21 @@ jobs:
           cat > /tmp/patch_one.sh <<'EOS'
           #!/usr/bin/env bash
           set -uo pipefail
-
           src="$1"
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
 
-          # Refuse non-.deb
           magic="$(head -c 8 "$src")"
           if [ "$magic" != "!<arch>" ]; then
-            echo "NOT-A-DEB: $src" >&2
-            exit 0
+            echo "NOT-A-DEB: $src" >&2; exit 0
           fi
 
-          # Extract
           if ! dpkg-deb -R "$src" "$tmp" 2>/tmp/dpkg.err; then
-            echo "EXTRACT-FAIL: $(basename "$src"): $(head -1 /tmp/dpkg.err)" >&2
-            exit 0
+            echo "EXTRACT-FAIL: $(basename "$src"): $(head -1 /tmp/dpkg.err)" >&2; exit 0
           fi
 
-          # Run the python patcher on the extracted directory
           python3 /tmp/patch_dir.py "$tmp"
 
-          # DEBIAN permissions + conffiles cleanup
           if [ -d "$tmp/DEBIAN" ]; then
             for s in preinst postinst prerm postrm config; do
               [ -f "$tmp/DEBIAN/$s" ] && chmod 0755 "$tmp/DEBIAN/$s" || true
@@ -400,7 +382,6 @@ jobs:
             fi
           fi
 
-          # Ensure data dirs are readable (only if data/ exists)
           if [ -d "$tmp/data" ]; then
             find "$tmp/data" -type d -print0 2>/dev/null | while IFS= read -r -d '' d; do
               cur="$(stat -c '%a' "$d" 2>/dev/null || echo 755)"
@@ -408,33 +389,22 @@ jobs:
             done || true
           fi
 
-          # Repack with fallbacks
-          if dpkg-deb --root-owner-group -b "$tmp" "$src" >/dev/null 2>&1; then
-            echo "OK"
-          elif dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$src" >/dev/null 2>&1; then
-            echo "OK-GZIP"
-          else
-            echo "PACK-FAIL: $src" >&2
-          fi
+          if dpkg-deb --root-owner-group -b "$tmp" "$src" >/dev/null 2>&1; then echo "OK"
+          elif dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$src" >/dev/null 2>&1; then echo "OK-GZIP"
+          else echo "PACK-FAIL: $src" >&2; fi
           exit 0
           EOS
           chmod +x /tmp/patch_one.sh
 
           : > /tmp/patch-outcomes.txt
           : > /tmp/patch-failures.txt
-
           total=0
           while IFS= read -r -d '' deb; do
             total=$((total + 1))
             outcome=$(bash /tmp/patch_one.sh "$deb" 2>/tmp/patch-err)
             printf '%s\t%s\n' "$outcome" "$deb" >> /tmp/patch-outcomes.txt
-            case "$outcome" in
-              OK|OK-GZIP) ;;
-              *) echo "$outcome: $deb" >> /tmp/patch-failures.txt ;;
-            esac
-            if [ $((total % 100)) -eq 0 ]; then
-              echo ">>> patched $total files so far..."
-            fi
+            case "$outcome" in OK|OK-GZIP) ;; *) echo "$outcome: $deb" >> /tmp/patch-failures.txt ;; esac
+            if [ $((total % 100)) -eq 0 ]; then echo ">>> patched $total files so far..."; fi
           done < <(find "$SRC_ROOT" -type f -name '*.deb' -print0)
 
           echo ""
@@ -523,7 +493,10 @@ jobs:
               md5=$(md5sum "$deb" | awk '{print $1}')
               sha1=$(sha1sum "$deb" | awk '{print $1}')
               sha256=$(sha256sum "$deb" | awk '{print $1}')
-              dpkg-deb -f "$deb" >> "$outd/Packages"
+              
+              # FIX: Strip blank lines to prevent a new block starting with Filename:
+              dpkg-deb -f "$deb" | grep -v '^$' >> "$outd/Packages"
+              
               {
                 echo "Filename: ${relpath}"
                 echo "Size: ${size}"
@@ -534,7 +507,12 @@ jobs:
               } >> "$outd/Packages"
               placed=$((placed + 1))
             done < "${tsv}.w"
+            
             echo "    placed: $placed"
+            if [ "$placed" -eq 0 ]; then
+              echo "::error::No packages placed for $target/$comp"
+              exit 1
+            fi
             gzip -kf -9 "$outd/Packages"
             rm -f "$outd/Packages.xz" "$tsv" "${tsv}.w"
           done < "$WORK_DIR/dist-comp.txt"
@@ -562,7 +540,12 @@ jobs:
                 echo "APT::FTPArchive::Release::Components \"${comps}\";"
                 echo "APT::FTPArchive::Release::Description \"xodos ${target} (${dist})\";"
               } > "$conf"
-              apt-ftparchive -c "$conf" release "$target/dists/$dist" > "$target/dists/$dist/Release"
+              
+              if ! apt-ftparchive -c "$conf" release "$target/dists/$dist" > "$target/dists/$dist/Release"; then
+                echo "::error::apt-ftparchive failed for $target/$dist"
+                exit 1
+              fi
+              
               cp "$target/dists/$dist/Release" "$target/dists/$dist/InRelease"
             done
           done < "$WORK_DIR/targets.txt"

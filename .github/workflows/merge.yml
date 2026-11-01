@@ -1,0 +1,389 @@
+name: Merge Release Debs
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: "Space-separated list of release tags to merge (e.g., 'xodos-XoDos-tur-p99-2026.10.15-180304 xodos-XoDos-x11-p99-2026.10.15-180304')"
+        required: true
+      target_repo:
+        description: "Target repo prefix for the new merged release"
+        required: true
+        type: choice
+        options:
+          - main
+          - x11
+          - root
+          - glibc
+          - tur
+          - tur-on-device
+          - tur-continuous
+        default: "glibc"
+      target_part:
+        description: "Target part suffix for the new merged release (e.g., p8, p99)"
+        required: true
+        default: "p8"
+      patch_prefix:
+        description: "Patch com.termux → app.xodos2 (ASCII + UTF-16) in .deb files before upload"
+        type: boolean
+        default: true
+      delete_sources:
+        description: "Delete the source releases after a successful merge"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: merge-release-debs
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dpkg-dev python3
+
+      - name: Resolve output tag
+        id: resolve
+        run: |
+          set -euo pipefail
+          OUT_TAG="xodos-XoDos-${{ inputs.target_repo }}-${{ inputs.target_part }}"
+          echo "output_tag=$OUT_TAG" >> "$GITHUB_OUTPUT"
+          echo ">>> Target merged release tag: $OUT_TAG"
+          
+          # Save input tags to a file for use in later steps
+          printf '%s\n' ${{ inputs.tags }} > /tmp/tags.txt
+          echo ">>> Source tags to merge:"
+          cat /tmp/tags.txt
+
+      - name: Download and merge .deb files (newest version wins)
+        run: |
+          set -euo pipefail
+          mkdir -p merged
+          
+          declare -A seen
+          declare -A seen_tag
+          declare -A seen_ver
+          
+          total_downloaded=0
+          total_superseded=0
+          tags_processed=0
+
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "=================================================="
+            echo ">>> processing release: $tag"
+            echo "=================================================="
+
+            tmpdir=$(mktemp -d)
+            if ! gh release download "$tag" --repo "$REPO" --pattern "*.deb" --dir "$tmpdir" 2>/tmp/gh_err.log; then
+              echo ">>> WARN: no .deb files in $tag (or download failed)"
+              sed -n '1,5p' /tmp/gh_err.log || true
+              rm -rf "$tmpdir"
+              continue
+            fi
+
+            tags_processed=$((tags_processed + 1))
+            count=$(find "$tmpdir" -maxdepth 1 -type f -name '*.deb' | wc -l)
+            echo ">>> downloaded ${count} .deb file(s)"
+            total_downloaded=$((total_downloaded + count))
+
+            while IFS= read -r -d '' deb; do
+              pkg=$(dpkg-deb -f "$deb" Package 2>/dev/null || echo "")
+              if [ -z "$pkg" ]; then continue; fi
+              
+              arch=$(dpkg-deb -f "$deb" Architecture 2>/dev/null || echo "")
+              ver=$(dpkg-deb -f "$deb" Version 2>/dev/null || echo "")
+              key="${pkg}_${arch}"
+
+              # If we already have this package/arch, compare versions to keep the newest
+              if [ -n "${seen[$key]:-}" ]; then
+                old_ver="${seen_ver[$key]}"
+                if dpkg --compare-versions "$ver" gt "$old_ver"; then
+                  echo ">>> superseding $pkg $old_ver with newer $ver (from $tag)"
+                  rm -f "merged/${seen[$key]}"
+                  total_superseded=$((total_superseded + 1))
+                else
+                  echo ">>> keeping existing $pkg $old_ver (newer than $ver from $tag)"
+                  continue
+                fi
+              fi
+
+              base=$(basename "$deb")
+              cp -a "$deb" "merged/$base"
+              seen[$key]="$base"
+              seen_tag[$key]="$tag"
+              seen_ver[$key]="$ver"
+            done < <(find "$tmpdir" -maxdepth 1 -type f -name '*.deb' -print0)
+
+            rm -rf "$tmpdir"
+          done < /tmp/tags.txt
+
+          echo ""
+          echo "=================================================="
+          echo ">>> tags processed:   $tags_processed"
+          echo ">>> total downloaded: $total_downloaded"
+          echo ">>> total superseded: $total_superseded"
+          echo ">>> final merged set: $(find merged -maxdepth 1 -type f -name '*.deb' | wc -l) .deb file(s)"
+          echo "=================================================="
+
+      - name: Patch com.termux → app.xodos2 in merged .deb
+        if: ${{ inputs.patch_prefix == true }}
+        run: |
+          set -euo pipefail
+          
+          cat > /tmp/patch_dir.py <<'PYEOF'
+          import os, sys
+          root = sys.argv[1]
+          
+          for dirpath, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
+              for d in dirnames:
+                  if 'com.termux' in d:
+                      old_path = os.path.join(dirpath, d)
+                      new_path = os.path.join(dirpath, d.replace('com.termux', 'app.xodos2'))
+                      try:
+                          os.rename(old_path, new_path)
+                      except Exception:
+                          pass
+
+          old_ascii = b"com.termux"
+          new_ascii = b"app.xodos2"
+          old_le = "com.termux".encode("utf-16-le")
+          new_le = "app.xodos2".encode("utf-16-le")
+          old_be = "com.termux".encode("utf-16-be")
+          new_be = "app.xodos2".encode("utf-16-be")
+
+          for dirpath, _, filenames in os.walk(root, followlinks=False):
+              for filename in filenames:
+                  if filename.endswith(('.gz', '.xz', '.zst', '.bz2', '.lz4', '.lzma', '.zip', '.jar', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico')):
+                      continue
+                  filepath = os.path.join(dirpath, filename)
+                  try:
+                      with open(filepath, 'rb') as f:
+                          data = f.read()
+                  except Exception:
+                      continue
+
+                  changed = False
+                  if old_ascii in data:
+                      data = data.replace(old_ascii, new_ascii)
+                      changed = True
+                  if old_le in data:
+                      data = data.replace(old_le, new_le)
+                      changed = True
+                  if old_be in data:
+                      data = data.replace(old_be, new_be)
+                      changed = True
+
+                  if changed:
+                      try:
+                          with open(filepath, 'wb') as f:
+                              f.write(data)
+                      except Exception:
+                          pass
+          PYEOF
+
+          cat > /tmp/patch_one.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          src="$1"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          magic="$(head -c 8 "$src")"
+          if [ "$magic" != "!<arch>" ]; then
+            echo "NOT-A-DEB: $src" >&2; exit 0
+          fi
+
+          if ! dpkg-deb -R "$src" "$tmp" 2>/tmp/dpkg.err; then
+            echo "EXTRACT-FAIL: $(basename "$src"): $(head -1 /tmp/dpkg.err)" >&2; exit 0
+          fi
+
+          python3 /tmp/patch_dir.py "$tmp"
+
+          if [ -d "$tmp/DEBIAN" ]; then
+            for s in preinst postinst prerm postrm config; do
+              [ -f "$tmp/DEBIAN/$s" ] && chmod 0755 "$tmp/DEBIAN/$s" || true
+            done
+            for s in control conffiles md5sums shlibs symbols templates triggers; do
+              [ -f "$tmp/DEBIAN/$s" ] && chmod 0644 "$tmp/DEBIAN/$s" || true
+            done
+            if [ -f "$tmp/DEBIAN/conffiles" ]; then
+              : > "$tmp/DEBIAN/conffiles.new"
+              while IFS= read -r line || [ -n "$line" ]; do
+                line="${line%$'\r'}"
+                case "$line" in ""|\#*) printf '%s\n' "$line" >> "$tmp/DEBIAN/conffiles.new"; continue ;; esac
+                rel="${line#/}"
+                if [ -e "$tmp/$rel" ] || [ -L "$tmp/$rel" ]; then
+                  printf '%s\n' "$line" >> "$tmp/DEBIAN/conffiles.new"
+                fi
+              done < "$tmp/DEBIAN/conffiles"
+              mv "$tmp/DEBIAN/conffiles.new" "$tmp/DEBIAN/conffiles"
+            fi
+          fi
+
+          if [ -d "$tmp/data" ]; then
+            find "$tmp/data" -type d -print0 2>/dev/null | while IFS= read -r -d '' d; do
+              cur="$(stat -c '%a' "$d" 2>/dev/null || echo 755)"
+              if [ $((0$cur & 0700)) -ne 0700 ]; then chmod u+rwx "$d" 2>/dev/null || true; fi
+            done || true
+          fi
+
+          if dpkg-deb --root-owner-group -b "$tmp" "$src" >/dev/null 2>&1; then echo "OK"
+          elif dpkg-deb --root-owner-group -Zgzip -b "$tmp" "$src" >/dev/null 2>&1; then echo "OK-GZIP"
+          else echo "PACK-FAIL: $src" >&2; fi
+          exit 0
+          EOS
+          chmod +x /tmp/patch_one.sh
+
+          : > /tmp/patch-outcomes.txt
+          : > /tmp/patch-failures.txt
+          total=0
+          while IFS= read -r -d '' deb; do
+            total=$((total + 1))
+            outcome=$(bash /tmp/patch_one.sh "$deb" 2>/tmp/patch-err)
+            printf '%s\t%s\n' "$outcome" "$deb" >> /tmp/patch-outcomes.txt
+            case "$outcome" in OK|OK-GZIP) ;; *) echo "$outcome: $deb" >> /tmp/patch-failures.txt ;; esac
+            if [ $((total % 100)) -eq 0 ]; then echo ">>> patched $total files so far..."; fi
+          done < <(find merged -maxdepth 1 -type f -name '*.deb' -print0)
+
+          echo ""
+          echo ">>> patch summary:"
+          awk -F'\t' '{print $1}' /tmp/patch-outcomes.txt | sort | uniq -c | sort -rn
+          echo ">>> failures: $(wc -l < /tmp/patch-failures.txt)"
+          if [ -s /tmp/patch-failures.txt ]; then
+            head -10 /tmp/patch-failures.txt
+            echo "::error::patching failed — refusing to continue"
+            exit 1
+          fi
+          echo ">>> all $total files patched successfully"
+
+      - name: Sanity check merged set
+        run: |
+          set -euo pipefail
+          n=$(find merged -maxdepth 1 -type f -name '*.deb' | wc -l)
+          if [ "$n" -eq 0 ]; then
+            echo "::error::No .deb files in merged set — nothing to publish"
+            exit 1
+          fi
+          echo ">>> merged .deb files (first 30):"
+          find merged -maxdepth 1 -type f -name '*.deb' -printf '%f\n' | sort > /tmp/merged-list.txt
+          head -30 /tmp/merged-list.txt
+
+      - name: Create or update merged release
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.output_tag }}"
+
+          SOURCES=""
+          while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            SOURCES="${SOURCES}- ${t}"$'\n'
+          done < /tmp/tags.txt
+
+          printf 'Merged .deb set. For any package appearing in multiple sources, the newest version wins.\nPatch prefix enabled: %s\n\nSources merged:\n%s' "${{ inputs.patch_prefix }}" "$SOURCES" > /tmp/notes.txt
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo ">>> Release $TAG already exists. Updating metadata."
+            gh release edit "$TAG" --repo "$REPO" --notes-file /tmp/notes.txt
+          else
+            echo ">>> Creating new release $TAG"
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "XoDos merged release ($TAG)" \
+              --notes-file /tmp/notes.txt \
+              --target "${{ github.sha }}"
+          fi
+
+      - name: Upload merged .deb files
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.output_tag }}"
+          mapfile -t FILES < <(find merged -maxdepth 1 -type f -name '*.deb' | sort)
+          total="${#FILES[@]}"
+          echo ">>> uploading $total files to $TAG"
+
+          i=0
+          failed=0
+          declare -a failed_files=()
+
+          for f in "${FILES[@]}"; do
+            i=$((i + 1))
+            printf '[%d/%d] %s ... ' "$i" "$total" "$(basename "$f")"
+            ok=0
+            # Robust upload with 8 attempts for rate-limiting
+            for attempt in 1 2 3 4 5 6 7 8; do
+              if gh release upload "$TAG" "$f" --repo "$REPO" --clobber 2>/tmp/gh_err.log; then
+                ok=1
+                break
+              fi
+
+              if grep -qiE 'secondary rate limit|abuse|rate limit|too many requests|429' /tmp/gh_err.log; then
+                backoff=$((attempt * 60))
+                echo
+                echo "    ↳ rate limited (attempt ${attempt}/8), sleeping ${backoff}s"
+              else
+                backoff=$((attempt * 5))
+                echo
+                echo "    ↳ error (attempt ${attempt}/8), sleeping ${backoff}s"
+                sed -n '1,3p' /tmp/gh_err.log || true
+              fi
+              sleep "$backoff"
+            done
+
+            if [ "$ok" -eq 1 ]; then
+              echo "    ok"
+            else
+              echo "    FAILED after 8 attempts: $(basename "$f")"
+              failed=$((failed + 1))
+              failed_files+=("$f")
+            fi
+
+            sleep 3
+          done
+
+          echo ""
+          echo "=================================================="
+          echo ">>> upload summary: $((total - failed))/$total ok, $failed failed"
+          if [ "$failed" -gt 0 ]; then
+            echo ">>> failed files:"
+            for ff in "${failed_files[@]}"; do
+              echo "    $(basename "$ff")"
+            done
+            echo "=================================================="
+            echo "::warning::$failed/${total} upload(s) failed after retries"
+            exit 1
+          fi
+          echo ">>> all ${total} uploaded"
+
+      - name: Verify merged release
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.output_tag }}"
+          count=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets | length')
+          echo ">>> release $TAG has $count assets"
+
+      - name: Optionally delete source releases
+        if: ${{ inputs.delete_sources == true }}
+        run: |
+          set -euo pipefail
+          NEW_TAG="${{ steps.resolve.outputs.output_tag }}"
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            [ "$tag" = "$NEW_TAG" ] && continue
+            echo ">>> deleting release $tag"
+            gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag || true
+          done < /tmp/tags.txt
+          echo ">>> done"

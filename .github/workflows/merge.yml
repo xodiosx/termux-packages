@@ -59,7 +59,8 @@ jobs:
         id: resolve
         run: |
           set -euo pipefail
-          OUT_TAG="xodos-XoDos-${{ inputs.target_repo }}-${{ inputs.target_part }}"
+          TS=$(date -u +'%Y.%m.%d-%H%M%S')
+          OUT_TAG="xodos-XoDos-${{ inputs.target_repo }}-${{ inputs.target_part }}-${TS}"
           echo "output_tag=$OUT_TAG" >> "$GITHUB_OUTPUT"
           echo ">>> Target merged release tag: $OUT_TAG"
           

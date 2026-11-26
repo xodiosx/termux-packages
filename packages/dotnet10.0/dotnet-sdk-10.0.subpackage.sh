@@ -1,6 +1,6 @@
 TERMUX_SUBPKG_DESCRIPTION=".NET 10.0 SDK"
 TERMUX_SUBPKG_DEPEND_ON_PARENT=false
-TERMUX_SUBPKG_DEPENDS="aspnetcore-runtime-10.0, aspnetcore-targeting-pack-10.0, dotnet-apphost-pack-10.0, dotnet-runtime-10.0, dotnet-targeting-pack-10.0, dotnet-templates-10.0"
+TERMUX_SUBPKG_DEPENDS="aspnetcore-runtime-10.0 (= ${TERMUX_PKG_FULLVERSION}), aspnetcore-targeting-pack-10.0 (= ${TERMUX_PKG_FULLVERSION}), dotnet-apphost-pack-10.0 (= ${TERMUX_PKG_FULLVERSION}), dotnet-runtime-10.0 (= ${TERMUX_PKG_FULLVERSION}), dotnet-targeting-pack-10.0 (= ${TERMUX_PKG_FULLVERSION}), dotnet-templates-10.0 (= ${TERMUX_PKG_FULLVERSION})"
 TERMUX_SUBPKG_INCLUDE=$(cat "${TERMUX_PKG_TMPDIR}"/dotnet-sdk.txt)
 
 termux_step_create_subpkg_debscripts() {
@@ -18,9 +18,9 @@ termux_step_create_subpkg_debscripts() {
 	Pass '-v n' or '-v d' or '-v diag' to increase
 	log verbosity.
 
-	Initial build only offers Mono runtime.
+	Runs on CoreCLR (Mono on i686). NativeAOT
+	publishing is not available on the device.
 	Check logcat for runtime errors.
-	CoreCLR is still WIP.
 
 	EOL
 	EOF

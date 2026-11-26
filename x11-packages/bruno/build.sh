@@ -2,11 +2,11 @@ TERMUX_PKG_HOMEPAGE=https://www.usebruno.com
 TERMUX_PKG_DESCRIPTION="Opensource API Client for Exploring and Testing APIs"
 TERMUX_PKG_LICENSE="MIT"
 TERMUX_PKG_MAINTAINER="Gouranga Das Samrat <gouranga.das.khulna@gmail.com>"
-TERMUX_PKG_VERSION="4.2.1"
+TERMUX_PKG_VERSION="4.4.0"
 TERMUX_PKG_SRCURL="https://github.com/usebruno/bruno/archive/refs/tags/v${TERMUX_PKG_VERSION}.tar.gz"
-TERMUX_PKG_SHA256=f3e3f310f5d28baa95d55e4629595356df7500db66346d44406181070805bec3
-TERMUX_PKG_DEPENDS="electron42, libx11"
-TERMUX_PKG_BUILD_DEPENDS="electron42-headers, pkg-config"
+TERMUX_PKG_SHA256=886aa85000119b6c204ed93c5416b1272491dc7b1acd46466db24ce82163eb13
+TERMUX_PKG_DEPENDS="electron43, libx11"
+TERMUX_PKG_BUILD_DEPENDS="electron43-headers, pkg-config"
 TERMUX_PKG_BUILD_IN_SRC=true
 # Chromium/Electron don't support i686 on Linux.
 TERMUX_PKG_EXCLUDED_ARCHES="i686"

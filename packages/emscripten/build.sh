@@ -2,7 +2,7 @@ TERMUX_PKG_HOMEPAGE=https://emscripten.org
 TERMUX_PKG_DESCRIPTION="Emscripten: An LLVM-to-WebAssembly Compiler"
 TERMUX_PKG_LICENSE="MIT"
 TERMUX_PKG_MAINTAINER="@termux"
-TERMUX_PKG_VERSION="6.0.12"
+TERMUX_PKG_VERSION="7.0.1"
 TERMUX_PKG_SRCURL=git+https://github.com/emscripten-core/emscripten
 TERMUX_PKG_GIT_BRANCH="${TERMUX_PKG_VERSION}"
 TERMUX_PKG_DEPENDS="nodejs-lts | nodejs, python"
@@ -73,13 +73,13 @@ opt/emscripten/LICENSE
 
 # https://github.com/emscripten-core/emscripten/issues/11362
 # can switch to stable LLVM to save space once above is fixed
-_LLVM_COMMIT=55ea1f4ebea23d0355d5cdb075f1e12f28ab82d0
-_LLVM_TGZ_SHA256=a9fa76919d17994079fd2280f652ee42cd069d8d76cd71aa424c882a999dd981
+_LLVM_COMMIT=d361f7b3f5946f69f9e9e54fb28feac5da45d7d0
+_LLVM_TGZ_SHA256=f9f3f349913aee3df17e8a1d34224db679e560a18266dbcffc4dd9402e01557a
 
 # https://github.com/emscripten-core/emscripten/issues/12252
 # upstream says better bundle the right binaryen revision for now
-_BINARYEN_COMMIT=64722e141b9796f2778b9cccfbfa6405eb5bcc7f
-_BINARYEN_TGZ_SHA256=208c67edaab39c9b86410e8151f8e9767342f732a5c05da7b6650dfdf54d052e
+_BINARYEN_COMMIT=e7a4b90f3c638d57dc5a9bf5b49a9a0342278af4
+_BINARYEN_TGZ_SHA256=98705ca9218e620cd1bb6fcd838ada2eb6b37db4864cc7991b4e8ac8cc5528fc
 
 # https://github.com/emscripten-core/emsdk/blob/main/emsdk.py
 # https://chromium.googlesource.com/emscripten-releases/+/refs/heads/main/src/build.py
@@ -106,6 +106,7 @@ _LLVM_BUILD_ARGS="
 -DLLVM_NATIVE_TOOL_DIR=${TERMUX_PKG_HOSTBUILD_DIR}/bin
 -DCLANG_DEFAULT_LINKER=lld
 -DCLANG_ENABLE_ARCMT=OFF
+-DCLANG_ENABLE_CIR=OFF
 -DCLANG_ENABLE_STATIC_ANALYZER=OFF
 -DCLANG_LINKS_TO_CREATE=clang++;wasm32-clang;wasm32-clang++;wasm32-wasi-clang;wasm32-wasi-clang++
 -DCOMPILER_RT_BUILD_CRT=OFF
@@ -343,6 +344,8 @@ termux_step_make_install() {
 
 	# https://github.com/emscripten-core/emscripten/pull/15840
 	sed -e "s|-git||" -i "${TERMUX_PKG_SRCDIR}/emscripten-version.txt"
+
+	./bootstrap.py
 
 	# skip using Makefile which does host npm install
 	rm -fr "${TERMUX_PREFIX}/opt/emscripten"

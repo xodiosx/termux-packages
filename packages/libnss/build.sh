@@ -3,9 +3,9 @@ TERMUX_PKG_DESCRIPTION="Network Security Services (NSS)"
 TERMUX_PKG_LICENSE="MPL-2.0"
 TERMUX_PKG_LICENSE_FILE="nss/COPYING"
 TERMUX_PKG_MAINTAINER="@termux"
-TERMUX_PKG_VERSION="3.131"
+TERMUX_PKG_VERSION="3.134"
 TERMUX_PKG_SRCURL=https://archive.mozilla.org/pub/security/nss/releases/NSS_${TERMUX_PKG_VERSION//./_}_RTM/src/nss-${TERMUX_PKG_VERSION}.tar.gz
-TERMUX_PKG_SHA256=ca0005bc77e9255d9942103e6f9756cfe311a3df72afa99860709e386eb3c167
+TERMUX_PKG_SHA256=bb3b300b457f44da9a9486917c3b33bbc5935ae3cdf60aa759a6880889439c50
 TERMUX_PKG_AUTO_UPDATE=true
 TERMUX_PKG_DEPENDS="libnspr, libsqlite"
 TERMUX_PKG_BUILD_IN_SRC=true
@@ -66,7 +66,8 @@ termux_step_make_install() {
 		-e "s|%NSPR_VERSION%|${nsprver}|g" \
 		nss/pkg/pkg-config/nss.pc.in > $pkgconfig_dir/nss.pc
 	cd dist
-	install -Dm600 -t $TERMUX_PREFIX/include/nss public/nss/*
+	install -Dm600 -t $TERMUX_PREFIX/include/nss $(find public/nss -maxdepth 1 ! -type d)
+	install -Dm600 -t $TERMUX_PREFIX/include/nss/mozpkix public/nss/mozpkix/*
 	install -Dm600 -t $TERMUX_PREFIX/include/nss/private private/nss/*
 	install -Dm600 -t $TERMUX_PREFIX/include/dbm public/dbm/*
 	install -Dm600 -t $TERMUX_PREFIX/include/dbm/private private/dbm/*
